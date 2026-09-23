@@ -1,0 +1,7 @@
+uvicorn
+fastapi
+psycopg
+PyJWT
+psycopg-pool
+psycopg-binary
+python-dotenv
