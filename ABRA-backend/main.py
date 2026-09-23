@@ -72,8 +72,8 @@ async def log_punch(data: AbraModel, token: HTTPAuthorizationCredentials = Depen
                         network_type
                     )
                     VALUES (
-                        %(timestamp)s,
-                        %(day)s,
+                        CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata',
+                        (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date,
                         %(latitude)s,
                         %(longitude)s,
                         %(speed)s,

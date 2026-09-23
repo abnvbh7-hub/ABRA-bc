@@ -9,8 +9,8 @@ class LoginModel(BaseModel):
 
 
 class AbraModel(BaseModel):
-    timestamp: datetime
-    day: date
+    timestamp: Optional[datetime] = None
+    day: Optional[date] = None
 
     latitude: Optional[float] = None
     longitude: Optional[float] = None
