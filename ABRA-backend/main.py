@@ -121,6 +121,24 @@ async def pick_data(token: HTTPAuthorizationCredentials = Depends(HTTPBearer()))
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+@app.get("/payments")
+async def get_payments(token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM abradb WHERE amount IS NOT NULL AND vendor IS NOT NULL ORDER BY timestamp DESC LIMIT 500")
+                rows = cur.fetchall()
+                columns = [desc[0] for desc in cur.description]
+                result = [dict(zip(columns, row)) for row in rows]
+
+        return {"status": "success", "data": result}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 @app.get("/history")
 async def history_data(range: str = "today", token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
     try:
