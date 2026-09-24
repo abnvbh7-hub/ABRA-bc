@@ -121,6 +121,30 @@ async def pick_data(token: HTTPAuthorizationCredentials = Depends(HTTPBearer()))
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+@app.get("/history")
+async def history_data(range: str = "today", token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+        
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                if range == "12h":
+                    cur.execute("SELECT * FROM abradb WHERE timestamp >= NOW() - INTERVAL '12 hours' ORDER BY timestamp ASC")
+                else:
+                    cur.execute("SELECT * FROM abradb WHERE DATE(timestamp) = CURRENT_DATE ORDER BY timestamp ASC")
+                    
+                rows = cur.fetchall()
+                columns = [desc[0] for desc in cur.description]
+                result = [dict(zip(columns, row)) for row in rows]
+                
+        return {"status": "success", "data": result}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 @app.post("/upload_statement")
 async def upload_statement(file: UploadFile = File(...), token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
     try:
