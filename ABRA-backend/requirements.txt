@@ -6,3 +6,4 @@ psycopg-pool
 psycopg-binary
 python-dotenv
 python-multipart
+boto3
