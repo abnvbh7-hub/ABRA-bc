@@ -235,6 +235,7 @@ async def post_gallery(data: GalleryModel, token: HTTPAuthorizationCredentials =
                     """,
                     data.model_dump()
                 )
+                conn.commit()
         return {"status": "success"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -256,6 +257,7 @@ async def delete_gallery(item_id: int, token: HTTPAuthorizationCredentials = Dep
                     except Exception as e:
                         print("Failed to delete from B2:", e)
                 cur.execute("DELETE FROM abragallery WHERE id = %s", (item_id,))
+                conn.commit()
         return {"status": "success"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
