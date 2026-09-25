@@ -149,8 +149,8 @@ async def history_data(range: str = "today", token: HTTPAuthorizationCredentials
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                if range == "12h":
-                    cur.execute("SELECT * FROM abradb WHERE timestamp >= NOW() - INTERVAL '12 hours' ORDER BY timestamp ASC")
+                if range == "yesterday":
+                    cur.execute("SELECT * FROM abradb WHERE DATE(timestamp) = CURRENT_DATE - INTERVAL '1 day' ORDER BY timestamp ASC")
                 else:
                     cur.execute("SELECT * FROM abradb WHERE DATE(timestamp) = CURRENT_DATE ORDER BY timestamp ASC")
                     
