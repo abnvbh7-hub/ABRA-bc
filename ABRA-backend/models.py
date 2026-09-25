@@ -34,3 +34,13 @@ class AbraModel(BaseModel):
     battery_level: Optional[float] = None
     is_charging: Optional[bool] = None
     network_type: Optional[str] = None
+
+class GalleryModel(BaseModel):
+    url: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    timestamp: Optional[datetime] = None
+    speed: Optional[float] = None
+    battery_level: Optional[float] = None
+    is_charging: Optional[bool] = None
+    network_type: Optional[str] = None

@@ -2,7 +2,7 @@ from database import pool
 import os
 from fastapi import Depends, FastAPI, UploadFile, File
 import uvicorn
-from models import AbraModel,LoginModel
+from models import AbraModel,LoginModel,GalleryModel
 from auth import create_access_token, verify_access_token
 import csv
 import io
@@ -136,6 +136,62 @@ async def get_payments(token: HTTPAuthorizationCredentials = Depends(HTTPBearer(
                 result = [dict(zip(columns, row)) for row in rows]
 
         return {"status": "success", "data": result}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/gallery")
+async def get_gallery(token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM abragallery ORDER BY timestamp DESC")
+                rows = cur.fetchall()
+                columns = [desc[0] for desc in cur.description]
+                result = [dict(zip(columns, row)) for row in rows]
+
+        return {"status": "success", "data": result}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/gallery")
+async def post_gallery(data: GalleryModel, token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO abragallery (
+                        url,
+                        latitude,
+                        longitude,
+                        timestamp,
+                        speed,
+                        battery_level,
+                        is_charging,
+                        network_type
+                    )
+                    VALUES (
+                        %(url)s,
+                        %(latitude)s,
+                        %(longitude)s,
+                        %(timestamp)s,
+                        %(speed)s,
+                        %(battery_level)s,
+                        %(is_charging)s,
+                        %(network_type)s
+                    )
+                    """,
+                    data.model_dump()
+                )
+        return {"status": "success"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
