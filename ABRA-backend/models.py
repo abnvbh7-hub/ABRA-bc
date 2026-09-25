@@ -36,7 +36,8 @@ class AbraModel(BaseModel):
     network_type: Optional[str] = None
 
 class GalleryModel(BaseModel):
-    url: str
+    url: Optional[str] = None
+    object_key: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     timestamp: Optional[datetime] = None

@@ -9,9 +9,21 @@ import io
 from datetime import datetime, date
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
+import boto3
+from botocore.client import Config
+import uuid
 
 app = FastAPI()
+
+s3 = boto3.client(
+    's3',
+    endpoint_url=f"https://{os.getenv('BLAZE_ENDPOINT')}",
+    aws_access_key_id=os.getenv('BLAZE_KEYID'),
+    aws_secret_access_key=os.getenv('BLAZE_APPKEY'),
+    config=Config(signature_version='s3v4')
+)
+B2_BUCKET_NAME = os.getenv('B2_BUCKET_NAME')
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -139,6 +151,28 @@ async def get_payments(token: HTTPAuthorizationCredentials = Depends(HTTPBearer(
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+@app.get("/upload_url")
+async def get_upload_url(content_type: str, token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    
+    object_key = f"{uuid.uuid4()}"
+    try:
+        presigned_url = s3.generate_presigned_url(
+            ClientMethod='put_object',
+            Params={
+                'Bucket': B2_BUCKET_NAME,
+                'Key': object_key,
+                'ContentType': content_type
+            },
+            ExpiresIn=3600
+        )
+        return {"status": "success", "upload_url": presigned_url, "object_key": object_key}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 @app.get("/gallery")
 async def get_gallery(token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
     try:
@@ -152,6 +186,14 @@ async def get_gallery(token: HTTPAuthorizationCredentials = Depends(HTTPBearer()
                 rows = cur.fetchall()
                 columns = [desc[0] for desc in cur.description]
                 result = [dict(zip(columns, row)) for row in rows]
+                
+                for item in result:
+                    if item.get("object_key"):
+                        item["url"] = s3.generate_presigned_url(
+                            ClientMethod='get_object',
+                            Params={'Bucket': B2_BUCKET_NAME, 'Key': item["object_key"]},
+                            ExpiresIn=3600
+                        )
 
         return {"status": "success", "data": result}
     except Exception as e:
@@ -170,6 +212,7 @@ async def post_gallery(data: GalleryModel, token: HTTPAuthorizationCredentials =
                     """
                     INSERT INTO abragallery (
                         url,
+                        object_key,
                         latitude,
                         longitude,
                         timestamp,
@@ -180,6 +223,7 @@ async def post_gallery(data: GalleryModel, token: HTTPAuthorizationCredentials =
                     )
                     VALUES (
                         %(url)s,
+                        %(object_key)s,
                         %(latitude)s,
                         %(longitude)s,
                         %(timestamp)s,
@@ -204,6 +248,13 @@ async def delete_gallery(item_id: int, token: HTTPAuthorizationCredentials = Dep
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
+                cur.execute("SELECT object_key FROM abragallery WHERE id = %s", (item_id,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    try:
+                        s3.delete_object(Bucket=B2_BUCKET_NAME, Key=row[0])
+                    except Exception as e:
+                        print("Failed to delete from B2:", e)
                 cur.execute("DELETE FROM abragallery WHERE id = %s", (item_id,))
         return {"status": "success"}
     except Exception as e:
