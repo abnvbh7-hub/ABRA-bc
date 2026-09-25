@@ -195,6 +195,20 @@ async def post_gallery(data: GalleryModel, token: HTTPAuthorizationCredentials =
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+@app.delete("/gallery/{item_id}")
+async def delete_gallery(item_id: int, token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM abragallery WHERE id = %s", (item_id,))
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 @app.get("/history")
 async def history_data(range: str = "today", token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
     try:
