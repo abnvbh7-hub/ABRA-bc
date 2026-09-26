@@ -4,17 +4,8 @@ from typing import Optional
 from pydantic import BaseModel
 
 class LoginModel(BaseModel):
-    email: str
-    password: str
-
-class SignupOTPModel(BaseModel):
-    email: str
     username: str
-
-class VerifyOTPModel(BaseModel):
-    email: str
-    otp: str
-    password: str
+    password:str
 
 
 class AbraModel(BaseModel):
