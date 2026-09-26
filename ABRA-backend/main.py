@@ -274,8 +274,11 @@ async def history_data(range: str = "today", token: HTTPAuthorizationCredentials
             with conn.cursor() as cur:
                 if range == "yesterday":
                     cur.execute("SELECT * FROM abradb WHERE DATE(timestamp) = CURRENT_DATE - INTERVAL '1 day' ORDER BY timestamp ASC")
-                else:
+                elif range == "today":
                     cur.execute("SELECT * FROM abradb WHERE DATE(timestamp) = CURRENT_DATE ORDER BY timestamp ASC")
+                else:
+                    # Assume range is YYYY-MM-DD
+                    cur.execute("SELECT * FROM abradb WHERE DATE(timestamp) = %s ORDER BY timestamp ASC", (range,))
                     
                 rows = cur.fetchall()
                 columns = [desc[0] for desc in cur.description]
