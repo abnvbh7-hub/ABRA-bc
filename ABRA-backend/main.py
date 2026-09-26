@@ -2,8 +2,9 @@ from database import pool
 import os
 from fastapi import Depends, FastAPI, UploadFile, File
 import uvicorn
-from models import AbraModel,LoginModel,GalleryModel
-from auth import create_access_token, verify_access_token
+from models import AbraModel, LoginModel, GalleryModel, SignupOTPModel, VerifyOTPModel
+from auth import create_access_token, verify_access_token, hash_password, verify_password
+from email_utils import send_email
 import csv
 import io
 from datetime import datetime, date
@@ -12,6 +13,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import boto3
 from botocore.client import Config
 import uuid
+import random
 
 app = FastAPI()
 
@@ -43,30 +45,102 @@ async def login(data: LoginModel):
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT username,password from auth limit 1")
+                cur.execute("SELECT id, username, password_hash, is_admin FROM users WHERE email = %s", (data.email,))
                 user = cur.fetchone()
-                if user and data.username == user[0] and data.password == user[1]:
-                    token = create_access_token({"username": data.username})
-                    return {"status": "success", "token": token}
+                if user and verify_password(data.password, user[2]):
+                    token = create_access_token({
+                        "user_id": user[0],
+                        "username": user[1],
+                        "email": data.email,
+                        "is_admin": user[3]
+                    })
+                    return {"status": "success", "token": token, "is_admin": user[3], "username": user[1]}
                 else:
-                    return {"status": "error", "message": "Invalid username or password"}
+                    return {"status": "error", "message": "Invalid email or password"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/signup/request_otp")
+async def request_otp(data: SignupOTPModel):
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM users WHERE email = %s", (data.email,))
+                if cur.fetchone():
+                    return {"status": "error", "message": "Email already exists"}
+                
+                otp = str(random.randint(100000, 999999))
+                
+                # Send OTP via email
+                email_body = f"""
+                <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto; border: 1px solid #eaeaea; border-radius: 10px;">
+                    <h2 style="color: #3b82f6;">Welcome to ABRA!</h2>
+                    <p style="font-size: 16px; color: #333;">Hello {data.username},</p>
+                    <p style="font-size: 16px; color: #333;">Your One-Time Password (OTP) for signup is:</p>
+                    <div style="background-color: #f3f4f6; padding: 15px; border-radius: 8px; text-align: center; margin: 20px 0;">
+                        <strong style="font-size: 32px; letter-spacing: 5px; color: #1f2937;">{otp}</strong>
+                    </div>
+                    <p style="font-size: 14px; color: #666;">This OTP will expire in 10 minutes.</p>
+                </div>
+                """
+                send_email(data.email, "ABRA - Your Signup OTP", email_body)
+                
+                # Print OTP to console for development backup
+                print(f"\n======================\nOTP for {data.email}: {otp}\n======================\n")
+                
+                cur.execute("""
+                    INSERT INTO otps (email, otp, expires_at) 
+                    VALUES (%s, %s, CURRENT_TIMESTAMP + INTERVAL '10 minutes')
+                    ON CONFLICT (email) DO UPDATE SET otp = EXCLUDED.otp, expires_at = EXCLUDED.expires_at
+                """, (data.email, otp))
+                
+                # Also temporarily store requested username
+                cur.execute("UPDATE otps SET otp = %s WHERE email = %s", (f"{otp}|{data.username}", data.email))
+                conn.commit()
+                return {"status": "success", "message": "OTP generated. Check console."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/signup/verify_otp")
+async def verify_otp(data: VerifyOTPModel):
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT otp, expires_at FROM otps WHERE email = %s", (data.email,))
+                row = cur.fetchone()
+                if not row or row[1] < datetime.utcnow():
+                    return {"status": "error", "message": "Invalid or expired OTP"}
+                
+                stored_otp, username = row[0].split('|')
+                if stored_otp != data.otp:
+                    return {"status": "error", "message": "Invalid OTP"}
+                
+                pw_hash = hash_password(data.password)
+                
+                cur.execute("INSERT INTO users (email, username, password_hash) VALUES (%s, %s, %s)", (data.email, username, pw_hash))
+                cur.execute("DELETE FROM otps WHERE email = %s", (data.email,))
+                conn.commit()
+                return {"status": "success"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
 @app.post("/punch")
 async def log_punch(data: AbraModel, token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
-    # Verify the token
     try:
-        verify_access_token(token.credentials)
+        payload = verify_access_token(token.credentials)
+        user_id = payload.get("user_id")
     except Exception as e:
         return {"status": "error", "message": str(e)}
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
+                data_dict = data.model_dump()
+                data_dict['user_id'] = user_id
                 cur.execute(
                     """
                     INSERT INTO abradb (
+                        user_id,
                         timestamp,
                         day,
                         latitude,
@@ -87,6 +161,7 @@ async def log_punch(data: AbraModel, token: HTTPAuthorizationCredentials = Depen
                         network_type
                     )
                     VALUES (
+                        %(user_id)s,
                         CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata',
                         (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date,
                         %(latitude)s,
@@ -107,8 +182,9 @@ async def log_punch(data: AbraModel, token: HTTPAuthorizationCredentials = Depen
                         %(network_type)s
                     )
                     """,
-                    data.model_dump()
+                    data_dict
                 )
+                conn.commit()
 
         return {"status": "success"}
     except Exception as e:
@@ -116,15 +192,15 @@ async def log_punch(data: AbraModel, token: HTTPAuthorizationCredentials = Depen
 
 @app.get("/pick")
 async def pick_data(token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
-    # Verify the token
     try:
-        verify_access_token(token.credentials)
+        payload = verify_access_token(token.credentials)
+        user_id = payload.get("user_id")
     except Exception as e:
         return {"status": "error", "message": str(e)}
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT * FROM abradb ORDER BY timestamp DESC LIMIT 100")
+                cur.execute("SELECT * FROM abradb WHERE user_id = %s ORDER BY timestamp DESC LIMIT 100", (user_id,))
                 rows = cur.fetchall()
                 columns = [desc[0] for desc in cur.description]
                 result = [dict(zip(columns, row)) for row in rows]
@@ -136,13 +212,14 @@ async def pick_data(token: HTTPAuthorizationCredentials = Depends(HTTPBearer()))
 @app.get("/payments")
 async def get_payments(token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
     try:
-        verify_access_token(token.credentials)
+        payload = verify_access_token(token.credentials)
+        user_id = payload.get("user_id")
     except Exception as e:
         return {"status": "error", "message": str(e)}
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT * FROM abradb WHERE amount IS NOT NULL AND vendor IS NOT NULL ORDER BY timestamp DESC LIMIT 500")
+                cur.execute("SELECT * FROM abradb WHERE user_id = %s AND amount IS NOT NULL AND vendor IS NOT NULL ORDER BY timestamp DESC LIMIT 500", (user_id,))
                 rows = cur.fetchall()
                 columns = [desc[0] for desc in cur.description]
                 result = [dict(zip(columns, row)) for row in rows]
@@ -176,13 +253,14 @@ async def get_upload_url(content_type: str, token: HTTPAuthorizationCredentials 
 @app.get("/gallery")
 async def get_gallery(token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
     try:
-        verify_access_token(token.credentials)
+        payload = verify_access_token(token.credentials)
+        user_id = payload.get("user_id")
     except Exception as e:
         return {"status": "error", "message": str(e)}
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT * FROM abragallery ORDER BY timestamp DESC")
+                cur.execute("SELECT * FROM abragallery WHERE user_id = %s ORDER BY timestamp DESC", (user_id,))
                 rows = cur.fetchall()
                 columns = [desc[0] for desc in cur.description]
                 result = [dict(zip(columns, row)) for row in rows]
@@ -202,15 +280,19 @@ async def get_gallery(token: HTTPAuthorizationCredentials = Depends(HTTPBearer()
 @app.post("/gallery")
 async def post_gallery(data: GalleryModel, token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
     try:
-        verify_access_token(token.credentials)
+        payload = verify_access_token(token.credentials)
+        user_id = payload.get("user_id")
     except Exception as e:
         return {"status": "error", "message": str(e)}
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
+                data_dict = data.model_dump()
+                data_dict['user_id'] = user_id
                 cur.execute(
                     """
                     INSERT INTO abragallery (
+                        user_id,
                         url,
                         object_key,
                         latitude,
@@ -222,6 +304,7 @@ async def post_gallery(data: GalleryModel, token: HTTPAuthorizationCredentials =
                         network_type
                     )
                     VALUES (
+                        %(user_id)s,
                         %(url)s,
                         %(object_key)s,
                         %(latitude)s,
@@ -233,7 +316,7 @@ async def post_gallery(data: GalleryModel, token: HTTPAuthorizationCredentials =
                         %(network_type)s
                     )
                     """,
-                    data.model_dump()
+                    data_dict
                 )
                 conn.commit()
         return {"status": "success"}
@@ -243,20 +326,21 @@ async def post_gallery(data: GalleryModel, token: HTTPAuthorizationCredentials =
 @app.delete("/gallery/{item_id}")
 async def delete_gallery(item_id: int, token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
     try:
-        verify_access_token(token.credentials)
+        payload = verify_access_token(token.credentials)
+        user_id = payload.get("user_id")
     except Exception as e:
         return {"status": "error", "message": str(e)}
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT object_key FROM abragallery WHERE id = %s", (item_id,))
+                cur.execute("SELECT object_key FROM abragallery WHERE id = %s AND user_id = %s", (item_id, user_id))
                 row = cur.fetchone()
                 if row and row[0]:
                     try:
                         s3.delete_object(Bucket=B2_BUCKET_NAME, Key=row[0])
                     except Exception as e:
                         print("Failed to delete from B2:", e)
-                cur.execute("DELETE FROM abragallery WHERE id = %s", (item_id,))
+                cur.execute("DELETE FROM abragallery WHERE id = %s AND user_id = %s", (item_id, user_id))
                 conn.commit()
         return {"status": "success"}
     except Exception as e:
@@ -265,7 +349,8 @@ async def delete_gallery(item_id: int, token: HTTPAuthorizationCredentials = Dep
 @app.get("/history")
 async def history_data(range: str = "today", token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
     try:
-        verify_access_token(token.credentials)
+        payload = verify_access_token(token.credentials)
+        user_id = payload.get("user_id")
     except Exception as e:
         return {"status": "error", "message": str(e)}
         
@@ -273,12 +358,11 @@ async def history_data(range: str = "today", token: HTTPAuthorizationCredentials
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 if range == "yesterday":
-                    cur.execute("SELECT * FROM abradb WHERE DATE(timestamp) = CURRENT_DATE - INTERVAL '1 day' ORDER BY timestamp ASC")
+                    cur.execute("SELECT * FROM abradb WHERE user_id = %s AND DATE(timestamp) = CURRENT_DATE - INTERVAL '1 day' ORDER BY timestamp ASC", (user_id,))
                 elif range == "today":
-                    cur.execute("SELECT * FROM abradb WHERE DATE(timestamp) = CURRENT_DATE ORDER BY timestamp ASC")
+                    cur.execute("SELECT * FROM abradb WHERE user_id = %s AND DATE(timestamp) = CURRENT_DATE ORDER BY timestamp ASC", (user_id,))
                 else:
-                    # Assume range is YYYY-MM-DD
-                    cur.execute("SELECT * FROM abradb WHERE DATE(timestamp) = %s ORDER BY timestamp ASC", (range,))
+                    cur.execute("SELECT * FROM abradb WHERE user_id = %s AND DATE(timestamp) = %s ORDER BY timestamp ASC", (user_id, range))
                     
                 rows = cur.fetchall()
                 columns = [desc[0] for desc in cur.description]
@@ -288,11 +372,11 @@ async def history_data(range: str = "today", token: HTTPAuthorizationCredentials
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-
 @app.post("/upload_statement")
 async def upload_statement(file: UploadFile = File(...), token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
     try:
-        verify_access_token(token.credentials)
+        payload = verify_access_token(token.credentials)
+        user_id = payload.get("user_id")
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -301,7 +385,6 @@ async def upload_statement(file: UploadFile = File(...), token: HTTPAuthorizatio
         text = content.decode("utf-8")
         reader = csv.reader(io.StringIO(text))
         
-        # Skip until we find the header row
         header = None
         for row in reader:
             if row and row[0] == "Date":
@@ -326,7 +409,6 @@ async def upload_statement(file: UploadFile = File(...), token: HTTPAuthorizatio
             if transaction_type != 'DEBIT':
                 continue
                 
-            # Parse Date and Time (e.g. "Sept 24, 2026", "9:36 AM")
             date_str = date_str.replace("Sept", "Sep")
             
             try:
@@ -358,14 +440,13 @@ async def upload_statement(file: UploadFile = File(...), token: HTTPAuthorizatio
                     vendor_str = vendors[0] if len(vendors) == 1 else "multiple"
                     amount = data['amount']
                     
-                    # Find the nearest row within 15 minutes (900 seconds)
                     cur.execute("""
                         SELECT timestamp 
                         FROM abradb 
-                        WHERE abs(EXTRACT(EPOCH FROM (timestamp - %(dt_minute)s::timestamp))) <= 900
+                        WHERE user_id = %(user_id)s AND abs(EXTRACT(EPOCH FROM (timestamp - %(dt_minute)s::timestamp))) <= 900
                         ORDER BY abs(EXTRACT(EPOCH FROM (timestamp - %(dt_minute)s::timestamp))) ASC 
                         LIMIT 1
-                    """, {'dt_minute': dt_minute})
+                    """, {'user_id': user_id, 'dt_minute': dt_minute})
                     
                     row = cur.fetchone()
                     if row:
@@ -373,10 +454,11 @@ async def upload_statement(file: UploadFile = File(...), token: HTTPAuthorizatio
                         cur.execute("""
                             UPDATE abradb
                             SET amount = %(amount)s, vendor = %(vendor)s
-                            WHERE timestamp = %(closest_timestamp)s
+                            WHERE user_id = %(user_id)s AND timestamp = %(closest_timestamp)s
                         """, {
                             'amount': amount, 
                             'vendor': vendor_str, 
+                            'user_id': user_id,
                             'closest_timestamp': closest_timestamp
                         })
                         processed_count += 1
@@ -386,11 +468,60 @@ async def upload_statement(file: UploadFile = File(...), token: HTTPAuthorizatio
                             'vendor': vendor_str,
                             'amount': amount
                         })
+                conn.commit()
 
         return {
             "status": "success", 
             "processed_minutes": processed_count,
             "unmatched_payments": unmatched
         }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/admin/users")
+async def get_admin_users(token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    try:
+        payload = verify_access_token(token.credentials)
+        is_admin = payload.get("is_admin")
+        if not is_admin:
+            return {"status": "error", "message": "Unauthorized"}
+            
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, username, email, is_admin FROM users ORDER BY id")
+                rows = cur.fetchall()
+                columns = [desc[0] for desc in cur.description]
+                result = [dict(zip(columns, row)) for row in rows]
+                
+                # Fetch basic stats per user
+                for user in result:
+                    cur.execute("SELECT COUNT(*) FROM abradb WHERE user_id = %s", (user['id'],))
+                    user['punch_count'] = cur.fetchone()[0]
+                    
+        return {"status": "success", "data": result}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/admin/history/{target_user_id}")
+async def get_admin_history(target_user_id: int, range: str = "today", token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    try:
+        payload = verify_access_token(token.credentials)
+        if not payload.get("is_admin"):
+            return {"status": "error", "message": "Unauthorized"}
+            
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                if range == "yesterday":
+                    cur.execute("SELECT * FROM abradb WHERE user_id = %s AND DATE(timestamp) = CURRENT_DATE - INTERVAL '1 day' ORDER BY timestamp ASC", (target_user_id,))
+                elif range == "today":
+                    cur.execute("SELECT * FROM abradb WHERE user_id = %s AND DATE(timestamp) = CURRENT_DATE ORDER BY timestamp ASC", (target_user_id,))
+                else:
+                    cur.execute("SELECT * FROM abradb WHERE user_id = %s AND DATE(timestamp) = %s ORDER BY timestamp ASC", (target_user_id, range))
+                    
+                rows = cur.fetchall()
+                columns = [desc[0] for desc in cur.description]
+                result = [dict(zip(columns, row)) for row in rows]
+                
+        return {"status": "success", "data": result}
     except Exception as e:
         return {"status": "error", "message": str(e)}

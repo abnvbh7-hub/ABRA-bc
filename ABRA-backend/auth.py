@@ -3,11 +3,18 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
 from fastapi import Depends, HTTPException, status
+import hashlib
 
 
 load_dotenv()
 
 SECRET_KEY = os.getenv("SECRET_KEY")
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return hash_password(plain_password) == hashed_password
 
 def create_access_token(data: dict, expires_delta: timedelta = timedelta(days=365)):
     to_encode = data.copy()
