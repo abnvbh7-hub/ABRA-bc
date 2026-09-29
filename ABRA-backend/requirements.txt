@@ -7,3 +7,6 @@ psycopg-binary
 python-dotenv
 python-multipart
 boto3
+opencv-python
+pandas
+scikit-learn

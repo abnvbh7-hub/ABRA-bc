@@ -12,6 +12,8 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import boto3
 from botocore.client import Config
 import uuid
+import numpy as np
+from sklearn.cluster import DBSCAN
 
 app = FastAPI()
 
@@ -287,6 +289,192 @@ async def history_data(range: str = "today", token: HTTPAuthorizationCredentials
         return {"status": "success", "data": result}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.get("/clusters")
+async def get_clusters(
+    range: str = "today", 
+    eps_meters: float = 50.0, 
+    min_samples: int = 5, 
+    token: HTTPAuthorizationCredentials = Depends(HTTPBearer())
+):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+        
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                if range == "yesterday":
+                    cur.execute("""
+                        SELECT id, timestamp, latitude, longitude, speed, battery_level, is_charging, network_type, wifi_count, vendor, amount 
+                        FROM abradb 
+                        WHERE (day = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date - INTERVAL '1 day' 
+                               OR DATE(timestamp) = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date - INTERVAL '1 day')
+                          AND latitude IS NOT NULL 
+                          AND longitude IS NOT NULL 
+                        ORDER BY timestamp ASC
+                    """)
+                elif range == "today":
+                    cur.execute("""
+                        SELECT id, timestamp, latitude, longitude, speed, battery_level, is_charging, network_type, wifi_count, vendor, amount 
+                        FROM abradb 
+                        WHERE (day = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date 
+                               OR DATE(timestamp) = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date)
+                          AND latitude IS NOT NULL 
+                          AND longitude IS NOT NULL 
+                        ORDER BY timestamp ASC
+                    """)
+                elif range == "all":
+                    cur.execute("""
+                        SELECT id, timestamp, latitude, longitude, speed, battery_level, is_charging, network_type, wifi_count, vendor, amount 
+                        FROM abradb 
+                        WHERE latitude IS NOT NULL 
+                          AND longitude IS NOT NULL 
+                        ORDER BY timestamp ASC LIMIT 5000
+                    """)
+                else:
+                    cur.execute("""
+                        SELECT id, timestamp, latitude, longitude, speed, battery_level, is_charging, network_type, wifi_count, vendor, amount 
+                        FROM abradb 
+                        WHERE (day = %s::date OR DATE(timestamp) = %s::date)
+                          AND latitude IS NOT NULL 
+                          AND longitude IS NOT NULL 
+                        ORDER BY timestamp ASC
+                    """, (range, range))
+                    
+                rows = cur.fetchall()
+                columns = [desc[0] for desc in cur.description]
+                raw_data = [dict(zip(columns, row)) for row in rows]
+
+        if not raw_data or len(raw_data) < min_samples:
+            return {
+                "status": "success",
+                "range": range,
+                "eps_meters": eps_meters,
+                "min_samples": min_samples,
+                "total_points": len(raw_data),
+                "total_clusters": 0,
+                "clustered_points_count": 0,
+                "noise_count": len(raw_data),
+                "clusters": [],
+                "noise_points": []
+            }
+
+        coords_deg = np.array([[float(item['latitude']), float(item['longitude'])] for item in raw_data], dtype=np.float64)
+        coords_rad = np.radians(coords_deg)
+
+        kms_per_radian = 6371.0088
+        eps_rad = (eps_meters / 1000.0) / kms_per_radian
+
+        db = DBSCAN(eps=eps_rad, min_samples=min_samples, metric='haversine', algorithm='ball_tree')
+        labels = db.fit_predict(coords_rad)
+
+        cluster_map = {}
+        noise_points = []
+
+        palette = [
+            "#3b82f6", "#10b981", "#f59e0b", "#ec4899", 
+            "#8b5cf6", "#06b6d4", "#f97316", "#14b8a6", 
+            "#6366f1", "#84cc16", "#a855f7", "#e11d48",
+            "#0284c7", "#16a34a", "#d97706", "#db2777"
+        ]
+
+        for idx, item in enumerate(raw_data):
+            label = int(labels[idx])
+            ts = item['timestamp'].isoformat() if hasattr(item['timestamp'], 'isoformat') else str(item['timestamp'])
+            pt = {
+                "id": item['id'],
+                "lat": float(item['latitude']),
+                "lon": float(item['longitude']),
+                "time": ts,
+                "speed": float(item['speed']) if item['speed'] is not None else 0.0,
+                "battery": item['battery_level'],
+                "charging": item['is_charging'],
+                "network": item['network_type'],
+                "vendor": item['vendor'],
+                "amount": float(item['amount']) if item['amount'] is not None else None
+            }
+            if label == -1:
+                noise_points.append(pt)
+            else:
+                if label not in cluster_map:
+                    cluster_map[label] = []
+                cluster_map[label].append(pt)
+
+        clusters = []
+        for cluster_id, pts in cluster_map.items():
+            lats = [p['lat'] for p in pts]
+            lons = [p['lon'] for p in pts]
+            speeds = [p['speed'] for p in pts if p['speed'] is not None]
+            payments = [p for p in pts if p['amount'] is not None]
+            
+            center_lat = float(np.mean(lats))
+            center_lon = float(np.mean(lons))
+            
+            d_lat = np.radians(np.array(lats) - center_lat)
+            d_lon = np.radians(np.array(lons) - center_lon)
+            a = np.sin(d_lat / 2.0)**2 + np.cos(np.radians(center_lat)) * np.cos(np.radians(lats)) * np.sin(d_lon / 2.0)**2
+            c = 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+            dists_meters = c * kms_per_radian * 1000.0
+            radius_meters = float(np.max(dists_meters)) if len(dists_meters) > 0 else 0.0
+
+            start_time = pts[0]['time']
+            end_time = pts[-1]['time']
+            
+            try:
+                dt_start = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                dt_end = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+                duration_mins = max(1, round((dt_end - dt_start).total_seconds() / 60))
+            except Exception:
+                duration_mins = len(pts)
+
+            clusters.append({
+                "cluster_id": cluster_id,
+                "cluster_num": len(clusters) + 1,
+                "color": palette[cluster_id % len(palette)],
+                "point_count": len(pts),
+                "center": {
+                    "lat": round(center_lat, 6),
+                    "lon": round(center_lon, 6)
+                },
+                "radius_meters": round(radius_meters, 1),
+                "bounds": {
+                    "min_lat": min(lats),
+                    "max_lat": max(lats),
+                    "min_lon": min(lons),
+                    "max_lon": max(lons)
+                },
+                "start_time": start_time,
+                "end_time": end_time,
+                "duration_minutes": duration_mins,
+                "avg_speed": round(float(np.mean(speeds)), 1) if speeds else 0.0,
+                "max_speed": round(float(np.max(speeds)), 1) if speeds else 0.0,
+                "payments": payments,
+                "points": pts
+            })
+
+        # Sort clusters by point count descending and re-assign 1-based index numbers
+        clusters.sort(key=lambda c: c['point_count'], reverse=True)
+        for i, c in enumerate(clusters):
+            c['cluster_num'] = i + 1
+
+        return {
+            "status": "success",
+            "range": range,
+            "eps_meters": eps_meters,
+            "min_samples": min_samples,
+            "total_points": len(raw_data),
+            "total_clusters": len(clusters),
+            "clustered_points_count": len(raw_data) - len(noise_points),
+            "noise_count": len(noise_points),
+            "clusters": clusters,
+            "noise_points": noise_points
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 
 
 @app.post("/upload_statement")
