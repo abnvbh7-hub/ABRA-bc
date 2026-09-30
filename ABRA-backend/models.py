@@ -47,7 +47,7 @@ class GalleryModel(BaseModel):
     network_type: Optional[str] = None
 
 class PaymentModel(BaseModel):
-    vendor: str
+    vendor: Optional[str] = "Payment"
     amount: float
     timestamp: Optional[datetime] = None
     latitude: Optional[float] = None

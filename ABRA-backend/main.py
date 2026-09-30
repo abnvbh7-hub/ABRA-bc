@@ -714,6 +714,8 @@ async def get_payment_clusters(
             ts = item['timestamp'].isoformat() if hasattr(item['timestamp'], 'isoformat') else str(item['timestamp'])
             pt = {
                 "id": item['id'],
+                "latitude": float(item['latitude']),
+                "longitude": float(item['longitude']),
                 "lat": float(item['latitude']),
                 "lon": float(item['longitude']),
                 "timestamp": ts,
