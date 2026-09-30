@@ -45,3 +45,10 @@ class GalleryModel(BaseModel):
     battery_level: Optional[float] = None
     is_charging: Optional[bool] = None
     network_type: Optional[str] = None
+
+class PaymentModel(BaseModel):
+    vendor: str
+    amount: float
+    timestamp: Optional[datetime] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None

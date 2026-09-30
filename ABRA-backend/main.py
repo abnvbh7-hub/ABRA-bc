@@ -2,7 +2,7 @@ from database import pool
 import os
 from fastapi import Depends, FastAPI, UploadFile, File
 import uvicorn
-from models import AbraModel,LoginModel,GalleryModel
+from models import AbraModel,LoginModel,GalleryModel,PaymentModel
 from auth import create_access_token, verify_access_token
 import csv
 import io
@@ -29,10 +29,10 @@ B2_BUCKET_NAME = os.getenv('B2_BUCKET_NAME')
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -58,7 +58,6 @@ async def login(data: LoginModel):
 
 @app.post("/punch")
 async def log_punch(data: AbraModel, token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
-    # Verify the token
     try:
         verify_access_token(token.credentials)
     except Exception as e:
@@ -118,7 +117,6 @@ async def log_punch(data: AbraModel, token: HTTPAuthorizationCredentials = Depen
 
 @app.get("/pick")
 async def pick_data(token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
-    # Verify the token
     try:
         verify_access_token(token.credentials)
     except Exception as e:
@@ -136,7 +134,7 @@ async def pick_data(token: HTTPAuthorizationCredentials = Depends(HTTPBearer()))
         return {"status": "error", "message": str(e)}
 
 @app.get("/payments")
-async def get_payments(token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+async def get_payments(range: str = "all", token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
     try:
         verify_access_token(token.credentials)
     except Exception as e:
@@ -144,7 +142,42 @@ async def get_payments(token: HTTPAuthorizationCredentials = Depends(HTTPBearer(
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT * FROM abradb WHERE amount IS NOT NULL AND vendor IS NOT NULL ORDER BY timestamp DESC LIMIT 500")
+                if range == "all" or not range:
+                    cur.execute("SELECT * FROM abradb WHERE amount IS NOT NULL AND vendor IS NOT NULL ORDER BY timestamp DESC LIMIT 1000")
+                elif range == "today":
+                    cur.execute("""
+                        SELECT * FROM abradb 
+                        WHERE amount IS NOT NULL AND vendor IS NOT NULL 
+                          AND (
+                            (timestamp::timestamptz AT TIME ZONE 'Asia/Kolkata')::date = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
+                            OR day = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date 
+                            OR DATE(timestamp) = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
+                          )
+                        ORDER BY timestamp DESC
+                    """)
+                elif range == "yesterday":
+                    cur.execute("""
+                        SELECT * FROM abradb 
+                        WHERE amount IS NOT NULL AND vendor IS NOT NULL 
+                          AND (
+                            (timestamp::timestamptz AT TIME ZONE 'Asia/Kolkata')::date = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date - INTERVAL '1 day'
+                            OR day = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date - INTERVAL '1 day' 
+                            OR DATE(timestamp) = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date - INTERVAL '1 day'
+                          )
+                        ORDER BY timestamp DESC
+                    """)
+                else:
+                    cur.execute("""
+                        SELECT * FROM abradb 
+                        WHERE amount IS NOT NULL AND vendor IS NOT NULL 
+                          AND (
+                            (timestamp::timestamptz AT TIME ZONE 'Asia/Kolkata')::date = %s::date
+                            OR day = %s::date 
+                            OR DATE(timestamp) = %s::date
+                          )
+                        ORDER BY timestamp DESC
+                    """, (range, range, range))
+                    
                 rows = cur.fetchall()
                 columns = [desc[0] for desc in cur.description]
                 result = [dict(zip(columns, row)) for row in rows]
@@ -152,6 +185,99 @@ async def get_payments(token: HTTPAuthorizationCredentials = Depends(HTTPBearer(
         return {"status": "success", "data": result}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.post("/payments")
+async def add_payment(data: PaymentModel, token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                ts = data.timestamp if data.timestamp else datetime.now()
+                cur.execute("""
+                    INSERT INTO abradb (
+                        timestamp,
+                        day,
+                        latitude,
+                        longitude,
+                        vendor,
+                        amount
+                    )
+                    VALUES (
+                        %(timestamp)s,
+                        %(timestamp)s::date,
+                        %(latitude)s,
+                        %(longitude)s,
+                        %(vendor)s,
+                        %(amount)s
+                    )
+                    RETURNING id
+                """, {
+                    "timestamp": ts,
+                    "latitude": data.latitude,
+                    "longitude": data.longitude,
+                    "vendor": data.vendor,
+                    "amount": data.amount
+                })
+                new_id = cur.fetchone()[0]
+                conn.commit()
+        return {"status": "success", "id": new_id, "message": "Payment added successfully"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.put("/payments/{payment_id}")
+async def update_payment(payment_id: int, data: PaymentModel, token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE abradb
+                    SET vendor = %(vendor)s,
+                        amount = %(amount)s,
+                        latitude = COALESCE(%(latitude)s, latitude),
+                        longitude = COALESCE(%(longitude)s, longitude),
+                        timestamp = COALESCE(%(timestamp)s, timestamp),
+                        day = COALESCE(%(timestamp)s::date, day)
+                    WHERE id = %(id)s
+                """, {
+                    "id": payment_id,
+                    "vendor": data.vendor,
+                    "amount": data.amount,
+                    "latitude": data.latitude,
+                    "longitude": data.longitude,
+                    "timestamp": data.timestamp
+                })
+                conn.commit()
+        return {"status": "success", "message": "Payment updated successfully"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.delete("/payments/{payment_id}")
+async def delete_payment(payment_id: int, token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT accel_x, gyro_x, speed FROM abradb WHERE id = %s", (payment_id,))
+                row = cur.fetchone()
+                if row and (row[0] is not None or row[1] is not None or row[2] is not None):
+                    cur.execute("UPDATE abradb SET amount = NULL, vendor = NULL WHERE id = %s", (payment_id,))
+                else:
+                    cur.execute("DELETE FROM abradb WHERE id = %s", (payment_id,))
+                conn.commit()
+        return {"status": "success", "message": "Payment deleted successfully"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 
 @app.get("/upload_url")
 async def get_upload_url(content_type: str, token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
@@ -474,6 +600,207 @@ async def get_clusters(
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.get("/payment_clusters")
+async def get_payment_clusters(
+    range: str = "all",
+    eps_meters: float = 100.0,
+    min_samples: int = 1,
+    token: HTTPAuthorizationCredentials = Depends(HTTPBearer())
+):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+        
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                if range == "all" or not range:
+                    cur.execute("""
+                        SELECT id, timestamp, latitude, longitude, amount, vendor, speed, battery_level, network_type
+                        FROM abradb 
+                        WHERE amount IS NOT NULL 
+                          AND vendor IS NOT NULL 
+                          AND latitude IS NOT NULL 
+                          AND longitude IS NOT NULL
+                        ORDER BY timestamp DESC LIMIT 2000
+                    """)
+                elif range == "today":
+                    cur.execute("""
+                        SELECT id, timestamp, latitude, longitude, amount, vendor, speed, battery_level, network_type
+                        FROM abradb 
+                        WHERE amount IS NOT NULL 
+                          AND vendor IS NOT NULL 
+                          AND latitude IS NOT NULL 
+                          AND longitude IS NOT NULL
+                          AND (
+                            (timestamp::timestamptz AT TIME ZONE 'Asia/Kolkata')::date = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
+                            OR day = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date 
+                            OR DATE(timestamp) = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
+                          )
+                        ORDER BY timestamp DESC
+                    """)
+                elif range == "yesterday":
+                    cur.execute("""
+                        SELECT id, timestamp, latitude, longitude, amount, vendor, speed, battery_level, network_type
+                        FROM abradb 
+                        WHERE amount IS NOT NULL 
+                          AND vendor IS NOT NULL 
+                          AND latitude IS NOT NULL 
+                          AND longitude IS NOT NULL
+                          AND (
+                            (timestamp::timestamptz AT TIME ZONE 'Asia/Kolkata')::date = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date - INTERVAL '1 day'
+                            OR day = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date - INTERVAL '1 day' 
+                            OR DATE(timestamp) = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date - INTERVAL '1 day'
+                          )
+                        ORDER BY timestamp DESC
+                    """)
+                else:
+                    cur.execute("""
+                        SELECT id, timestamp, latitude, longitude, amount, vendor, speed, battery_level, network_type
+                        FROM abradb 
+                        WHERE amount IS NOT NULL 
+                          AND vendor IS NOT NULL 
+                          AND latitude IS NOT NULL 
+                          AND longitude IS NOT NULL
+                          AND (
+                            (timestamp::timestamptz AT TIME ZONE 'Asia/Kolkata')::date = %s::date
+                            OR day = %s::date 
+                            OR DATE(timestamp) = %s::date
+                          )
+                        ORDER BY timestamp DESC
+                    """, (range, range, range))
+                rows = cur.fetchall()
+                columns = [desc[0] for desc in cur.description]
+                raw_data = [dict(zip(columns, row)) for row in rows]
+
+        if not raw_data:
+            return {
+                "status": "success",
+                "eps_meters": eps_meters,
+                "min_samples": min_samples,
+                "total_payments": 0,
+                "total_clusters": 0,
+                "total_amount": 0.0,
+                "clusters": [],
+                "noise_payments": []
+            }
+
+        coords_deg = np.array([[float(item['latitude']), float(item['longitude'])] for item in raw_data], dtype=np.float64)
+        coords_rad = np.radians(coords_deg)
+
+        kms_per_radian = 6371.0088
+        eps_rad = (eps_meters / 1000.0) / kms_per_radian
+
+        db = DBSCAN(eps=eps_rad, min_samples=min_samples, metric='haversine', algorithm='ball_tree')
+        labels = db.fit_predict(coords_rad)
+
+        cluster_map = {}
+        noise_payments = []
+
+        palette = [
+            "#10b981", "#3b82f6", "#f59e0b", "#ec4899", 
+            "#8b5cf6", "#06b6d4", "#f97316", "#14b8a6", 
+            "#6366f1", "#84cc16", "#a855f7", "#e11d48",
+            "#0284c7", "#16a34a", "#d97706", "#db2777"
+        ]
+
+        total_amount_all = sum(float(item['amount']) for item in raw_data if item['amount'] is not None)
+
+        for idx, item in enumerate(raw_data):
+            label = int(labels[idx])
+            ts = item['timestamp'].isoformat() if hasattr(item['timestamp'], 'isoformat') else str(item['timestamp'])
+            pt = {
+                "id": item['id'],
+                "lat": float(item['latitude']),
+                "lon": float(item['longitude']),
+                "timestamp": ts,
+                "vendor": item['vendor'],
+                "amount": float(item['amount']) if item['amount'] is not None else 0.0,
+                "network": item['network_type']
+            }
+            if label == -1:
+                noise_payments.append(pt)
+            else:
+                if label not in cluster_map:
+                    cluster_map[label] = []
+                cluster_map[label].append(pt)
+
+        clusters = []
+        for cluster_id, pts in cluster_map.items():
+            lats = [p['lat'] for p in pts]
+            lons = [p['lon'] for p in pts]
+            amounts = [p['amount'] for p in pts]
+            total_spent = sum(amounts)
+            
+            center_lat = float(np.mean(lats))
+            center_lon = float(np.mean(lons))
+            
+            d_lat = np.radians(np.array(lats) - center_lat)
+            d_lon = np.radians(np.array(lons) - center_lon)
+            a = np.sin(d_lat / 2.0)**2 + np.cos(np.radians(center_lat)) * np.cos(np.radians(lats)) * np.sin(d_lon / 2.0)**2
+            c = 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+            dists_meters = c * kms_per_radian * 1000.0
+            radius_meters = float(np.max(dists_meters)) if len(dists_meters) > 0 else 0.0
+
+            # Vendor breakdown
+            vendor_counts = {}
+            vendor_totals = {}
+            for p in pts:
+                v = p['vendor'] or "Unknown"
+                vendor_counts[v] = vendor_counts.get(v, 0) + 1
+                vendor_totals[v] = vendor_totals.get(v, 0.0) + p['amount']
+            
+            sorted_vendors = sorted(
+                [{"vendor": v, "count": vendor_counts[v], "total": round(vendor_totals[v], 2)} for v in vendor_counts],
+                key=lambda x: x['total'],
+                reverse=True
+            )
+            top_vendor = sorted_vendors[0]['vendor'] if sorted_vendors else "Unknown"
+
+            clusters.append({
+                "cluster_id": cluster_id,
+                "cluster_num": len(clusters) + 1,
+                "color": palette[cluster_id % len(palette)],
+                "payment_count": len(pts),
+                "total_amount": round(total_spent, 2),
+                "avg_amount": round(total_spent / len(pts), 2),
+                "top_vendor": top_vendor,
+                "vendors": sorted_vendors,
+                "center": {
+                    "lat": round(center_lat, 6),
+                    "lon": round(center_lon, 6)
+                },
+                "radius_meters": round(radius_meters, 1),
+                "bounds": {
+                    "min_lat": min(lats),
+                    "max_lat": max(lats),
+                    "min_lon": min(lons),
+                    "max_lon": max(lons)
+                },
+                "payments": pts
+            })
+
+        # Sort clusters by total spent descending
+        clusters.sort(key=lambda c: c['total_amount'], reverse=True)
+        for i, c in enumerate(clusters):
+            c['cluster_num'] = i + 1
+
+        return {
+            "status": "success",
+            "eps_meters": eps_meters,
+            "min_samples": min_samples,
+            "total_payments": len(raw_data),
+            "total_clusters": len(clusters),
+            "total_amount": round(total_amount_all, 2),
+            "clusters": clusters,
+            "noise_payments": noise_payments
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 
 
 
