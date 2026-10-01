@@ -1,5 +1,5 @@
 from datetime import datetime, date
-from typing import Optional
+from typing import Optional, Union, Any
 
 from pydantic import BaseModel
 
@@ -49,6 +49,6 @@ class GalleryModel(BaseModel):
 class PaymentModel(BaseModel):
     vendor: Optional[str] = "Payment"
     amount: float
-    timestamp: Optional[datetime] = None
+    timestamp: Optional[Union[datetime, str]] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None

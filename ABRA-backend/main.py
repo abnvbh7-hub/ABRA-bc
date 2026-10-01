@@ -6,7 +6,10 @@ from models import AbraModel,LoginModel,GalleryModel,PaymentModel
 from auth import create_access_token, verify_access_token
 import csv
 import io
-from datetime import datetime, date
+import json
+import urllib.request
+import urllib.parse
+from datetime import datetime, date, timezone
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import boto3
@@ -16,6 +19,52 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 
 app = FastAPI()
+
+_geocode_cache = {}
+
+def reverse_geocode(lat: float, lon: float) -> str:
+    if lat is None or lon is None:
+        return "Unknown Location"
+    key = (round(float(lat), 3), round(float(lon), 3))
+    if key in _geocode_cache:
+        return _geocode_cache[key]
+    try:
+        url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}&zoom=16&addressdetails=1"
+        req = urllib.request.Request(
+            url,
+            headers={'User-Agent': 'ABRA-Assistant/1.0 (Location Analytics)'}
+        )
+        with urllib.request.urlopen(req, timeout=2.0) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode())
+                addr = data.get('address', {})
+                parts = []
+                name_cand = (
+                    addr.get('suburb') or 
+                    addr.get('neighbourhood') or 
+                    addr.get('residential') or 
+                    addr.get('commercial') or 
+                    addr.get('amenity') or
+                    addr.get('road') or
+                    addr.get('quarter') or
+                    data.get('name')
+                )
+                city_cand = addr.get('city') or addr.get('town') or addr.get('county') or addr.get('state_district')
+                if name_cand:
+                    parts.append(str(name_cand))
+                if city_cand and city_cand != name_cand:
+                    parts.append(str(city_cand))
+                
+                clean_name = ", ".join(parts) if parts else (data.get('display_name', '').split(',')[0] if data.get('display_name') else None)
+                if clean_name:
+                    _geocode_cache[key] = clean_name
+                    return clean_name
+    except Exception as e:
+        pass
+    
+    fallback = f"Location ({round(float(lat), 3)}, {round(float(lon), 3)})"
+    _geocode_cache[key] = fallback
+    return fallback
 
 s3 = boto3.client(
     's3',
@@ -39,6 +88,11 @@ app.add_middleware(
 @app.get("/")
 async def read_root():
     return {"Adaptive Behavioral Reasoning Assistant": "ABRA"}
+
+@app.get("/reverse_geocode")
+async def get_reverse_geocode(lat: float, lon: float):
+    name = reverse_geocode(lat, lon)
+    return {"status": "success", "name": name, "lat": lat, "lon": lon}
 
 @app.post('/login')
 async def login(data: LoginModel):
@@ -195,32 +249,58 @@ async def add_payment(data: PaymentModel, token: HTTPAuthorizationCredentials = 
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                ts = data.timestamp if data.timestamp else datetime.now()
-                cur.execute("""
-                    INSERT INTO abradb (
-                        timestamp,
-                        day,
-                        latitude,
-                        longitude,
-                        vendor,
-                        amount
-                    )
-                    VALUES (
-                        %(timestamp)s,
-                        %(timestamp)s::date,
-                        %(latitude)s,
-                        %(longitude)s,
-                        %(vendor)s,
-                        %(amount)s
-                    )
-                    RETURNING id
-                """, {
-                    "timestamp": ts,
-                    "latitude": data.latitude,
-                    "longitude": data.longitude,
-                    "vendor": data.vendor,
-                    "amount": data.amount
-                })
+                if data.timestamp:
+                    ts_str = data.timestamp.isoformat() if hasattr(data.timestamp, 'isoformat') else str(data.timestamp)
+                    cur.execute("""
+                        INSERT INTO abradb (
+                            timestamp,
+                            day,
+                            latitude,
+                            longitude,
+                            vendor,
+                            amount
+                        )
+                        VALUES (
+                            %(timestamp)s::timestamptz,
+                            (%(timestamp)s::timestamptz AT TIME ZONE 'Asia/Kolkata')::date,
+                            %(latitude)s,
+                            %(longitude)s,
+                            %(vendor)s,
+                            %(amount)s
+                        )
+                        RETURNING id
+                    """, {
+                        "timestamp": ts_str,
+                        "latitude": data.latitude,
+                        "longitude": data.longitude,
+                        "vendor": data.vendor,
+                        "amount": data.amount
+                    })
+                else:
+                    cur.execute("""
+                        INSERT INTO abradb (
+                            timestamp,
+                            day,
+                            latitude,
+                            longitude,
+                            vendor,
+                            amount
+                        )
+                        VALUES (
+                            CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata',
+                            (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date,
+                            %(latitude)s,
+                            %(longitude)s,
+                            %(vendor)s,
+                            %(amount)s
+                        )
+                        RETURNING id
+                    """, {
+                        "latitude": data.latitude,
+                        "longitude": data.longitude,
+                        "vendor": data.vendor,
+                        "amount": data.amount
+                    })
                 new_id = cur.fetchone()[0]
                 conn.commit()
         return {"status": "success", "id": new_id, "message": "Payment added successfully"}
@@ -236,14 +316,15 @@ async def update_payment(payment_id: int, data: PaymentModel, token: HTTPAuthori
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
+                ts_str = (data.timestamp.isoformat() if hasattr(data.timestamp, 'isoformat') else str(data.timestamp)) if data.timestamp else None
                 cur.execute("""
                     UPDATE abradb
                     SET vendor = %(vendor)s,
                         amount = %(amount)s,
                         latitude = COALESCE(%(latitude)s, latitude),
                         longitude = COALESCE(%(longitude)s, longitude),
-                        timestamp = COALESCE(%(timestamp)s, timestamp),
-                        day = COALESCE(%(timestamp)s::date, day)
+                        timestamp = COALESCE(%(timestamp)s::timestamptz, timestamp),
+                        day = COALESCE((%(timestamp)s::timestamptz AT TIME ZONE 'Asia/Kolkata')::date, day)
                     WHERE id = %(id)s
                 """, {
                     "id": payment_id,
@@ -251,7 +332,7 @@ async def update_payment(payment_id: int, data: PaymentModel, token: HTTPAuthori
                     "amount": data.amount,
                     "latitude": data.latitude,
                     "longitude": data.longitude,
-                    "timestamp": data.timestamp
+                    "timestamp": ts_str
                 })
                 conn.commit()
         return {"status": "success", "message": "Payment updated successfully"}
@@ -556,9 +637,12 @@ async def get_clusters(
             except Exception:
                 duration_mins = len(pts)
 
+            loc_name = reverse_geocode(center_lat, center_lon)
             clusters.append({
                 "cluster_id": cluster_id,
                 "cluster_num": len(clusters) + 1,
+                "name": loc_name,
+                "location_name": loc_name,
                 "color": palette[cluster_id % len(palette)],
                 "point_count": len(pts),
                 "center": {
@@ -762,9 +846,12 @@ async def get_payment_clusters(
             )
             top_vendor = sorted_vendors[0]['vendor'] if sorted_vendors else "Unknown"
 
+            loc_name = reverse_geocode(center_lat, center_lon)
             clusters.append({
                 "cluster_id": cluster_id,
                 "cluster_num": len(clusters) + 1,
+                "name": loc_name,
+                "location_name": loc_name,
                 "color": palette[cluster_id % len(palette)],
                 "payment_count": len(pts),
                 "total_amount": round(total_spent, 2),
