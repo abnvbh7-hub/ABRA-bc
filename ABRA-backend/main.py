@@ -1,9 +1,11 @@
 from database import pool
 import os
-from fastapi import Depends, FastAPI, UploadFile, File
+from fastapi import Depends, FastAPI, UploadFile, File, Query
+from fastapi.responses import StreamingResponse
 import uvicorn
-from models import AbraModel,LoginModel,GalleryModel,PaymentModel
+from models import AbraModel, LoginModel, GalleryModel, PaymentModel, PersonUpdateModel, ProcessGalleryModel, ResolveSuggestionModel
 from auth import create_access_token, verify_access_token
+from facial import extract_faces_from_image, find_matching_person, cosine_similarity, classify_face_match
 import csv
 import io
 import json
@@ -19,6 +21,37 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 
 app = FastAPI()
+
+def init_db_schema():
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS abra_people (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        name TEXT,
+                        avatar_data TEXT,
+                        embeddings JSONB DEFAULT '[]'::jsonb,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                    ALTER TABLE abragallery ADD COLUMN IF NOT EXISTS person_ids JSONB DEFAULT '[]'::jsonb;
+                    CREATE TABLE IF NOT EXISTS abra_face_suggestions (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        photo_id INTEGER NOT NULL,
+                        person_id UUID NOT NULL,
+                        similarity DOUBLE PRECISION NOT NULL,
+                        avatar_data TEXT,
+                        embedding JSONB,
+                        status TEXT DEFAULT 'pending',
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                """)
+                conn.commit()
+    except Exception as e:
+        print(f"[DB Schema Init]: {e}")
+
+init_db_schema()
 
 _geocode_cache = {}
 
@@ -428,7 +461,8 @@ async def post_gallery(data: GalleryModel, token: HTTPAuthorizationCredentials =
                         speed,
                         battery_level,
                         is_charging,
-                        network_type
+                        network_type,
+                        person_ids
                     )
                     VALUES (
                         %(url)s,
@@ -439,10 +473,14 @@ async def post_gallery(data: GalleryModel, token: HTTPAuthorizationCredentials =
                         %(speed)s,
                         %(battery_level)s,
                         %(is_charging)s,
-                        %(network_type)s
+                        %(network_type)s,
+                        %(person_ids)s
                     )
                     """,
-                    data.model_dump()
+                    {
+                        **data.model_dump(),
+                        "person_ids": json.dumps(data.person_ids or [])
+                    }
                 )
                 conn.commit()
         return {"status": "success"}
@@ -995,6 +1033,594 @@ async def upload_statement(file: UploadFile = File(...), token: HTTPAuthorizatio
             "status": "success", 
             "processed_minutes": processed_count,
             "unmatched_payments": unmatched
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# ============================================================================
+# FACE RECOGNITION & PERSON CLUSTERING ENDPOINTS
+# ============================================================================
+
+@app.get("/people")
+async def get_people(token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT p.id, p.name, p.avatar_data, p.created_at, p.updated_at,
+                           (
+                               SELECT COUNT(*) 
+                               FROM abragallery g 
+                               WHERE g.person_ids IS NOT NULL 
+                                 AND (g.person_ids @> to_jsonb(p.id::text) OR g.person_ids ? (p.id::text))
+                           ) as photo_count
+                    FROM abra_people p
+                    ORDER BY photo_count DESC, p.updated_at DESC
+                """)
+                rows = cur.fetchall()
+                result = []
+                for r in rows:
+                    result.append({
+                        "id": str(r[0]),
+                        "name": r[1],
+                        "avatar_data": r[2],
+                        "created_at": r[3].isoformat() if r[3] else None,
+                        "updated_at": r[4].isoformat() if r[4] else None,
+                        "photo_count": int(r[5] or 0)
+                    })
+        return {"status": "success", "data": result}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/people/{person_id}")
+async def get_person_detail(person_id: str, token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, name, avatar_data, created_at, updated_at FROM abra_people WHERE id = %s", (person_id,))
+                person_row = cur.fetchone()
+                if not person_row:
+                    return {"status": "error", "message": "Person not found"}
+
+                person_info = {
+                    "id": str(person_row[0]),
+                    "name": person_row[1],
+                    "avatar_data": person_row[2],
+                    "created_at": person_row[3].isoformat() if person_row[3] else None,
+                    "updated_at": person_row[4].isoformat() if person_row[4] else None,
+                }
+
+                cur.execute("""
+                    SELECT * FROM abragallery 
+                    WHERE person_ids IS NOT NULL 
+                      AND (person_ids @> to_jsonb(%s::text) OR person_ids ? %s::text)
+                    ORDER BY timestamp DESC
+                """, (person_id, person_id))
+                rows = cur.fetchall()
+                columns = [desc[0] for desc in cur.description]
+                photos = [dict(zip(columns, row)) for row in rows]
+
+                for p in photos:
+                    if p.get("object_key"):
+                        p["url"] = s3.generate_presigned_url(
+                            ClientMethod='get_object',
+                            Params={'Bucket': B2_BUCKET_NAME, 'Key': p["object_key"]},
+                            ExpiresIn=3600
+                        )
+
+                person_info["photos"] = photos
+                person_info["photo_count"] = len(photos)
+
+        return {"status": "success", "data": person_info}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.patch("/people/{person_id}")
+async def update_person(person_id: str, data: PersonUpdateModel, token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    try:
+        clean_name = data.name.strip() if data.name and data.name.strip() else None
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE abra_people
+                    SET name = %s, updated_at = NOW()
+                    WHERE id = %s
+                """, (clean_name, person_id))
+                conn.commit()
+        return {"status": "success", "name": clean_name}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.delete("/people/{person_id}")
+async def delete_person(person_id: str, token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM abra_people WHERE id = %s", (person_id,))
+                cur.execute("""
+                    UPDATE abragallery
+                    SET person_ids = (
+                        SELECT COALESCE(jsonb_agg(elem), '[]'::jsonb)
+                        FROM jsonb_array_elements_text(person_ids) AS elem
+                        WHERE elem != %s
+                    )
+                    WHERE person_ids IS NOT NULL 
+                      AND (person_ids @> to_jsonb(%s::text) OR person_ids ? %s::text)
+                """, (person_id, person_id, person_id))
+                conn.commit()
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/people/suggestions")
+async def get_face_suggestions(token: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    """Returns all pending match suggestions where similarity was close to ~40% for user confirmation."""
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT 
+                        s.id, s.photo_id, s.person_id, s.similarity, s.avatar_data, 
+                        s.created_at, p.name, p.avatar_data,
+                        g.object_key, g.url, g.timestamp
+                    FROM abra_face_suggestions s
+                    LEFT JOIN abra_people p ON s.person_id = p.id
+                    LEFT JOIN abragallery g ON s.photo_id = g.id
+                    WHERE s.status = 'pending'
+                    ORDER BY s.created_at DESC
+                """)
+                rows = cur.fetchall()
+                suggestions = []
+                for r in rows:
+                    sugg_id, photo_id, person_id, sim, detected_avatar, created_at, p_name, p_avatar, obj_key, raw_url, photo_ts = r
+                    
+                    full_photo_url = raw_url
+                    if obj_key:
+                        try:
+                            full_photo_url = s3.generate_presigned_url(
+                                'get_object',
+                                Params={'Bucket': B2_BUCKET_NAME, 'Key': obj_key},
+                                ExpiresIn=3600
+                            )
+                        except Exception as e:
+                            print(f"Error presigning suggestion photo {obj_key}: {e}")
+
+                    suggestions.append({
+                        "id": str(sugg_id),
+                        "photo_id": photo_id,
+                        "person_id": str(person_id),
+                        "similarity": round(float(sim), 3),
+                        "similarity_percent": int(round(float(sim) * 100)),
+                        "detected_face_avatar": detected_avatar,
+                        "person_name": p_name or "Unknown Person",
+                        "person_avatar": p_avatar,
+                        "photo_url": full_photo_url,
+                        "photo_timestamp": photo_ts.isoformat() if photo_ts else None,
+                        "created_at": created_at.isoformat() if created_at else None
+                    })
+                return {"status": "success", "data": suggestions}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/people/suggestions/{suggestion_id}/resolve")
+async def resolve_face_suggestion(
+    suggestion_id: str,
+    body: ResolveSuggestionModel,
+    token: HTTPAuthorizationCredentials = Depends(HTTPBearer())
+):
+    """User confirms or rejects a borderline match."""
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    try:
+        action = body.action.lower().strip() # 'accept', 'reject', 'create_new'
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT photo_id, person_id, avatar_data, embedding, similarity FROM abra_face_suggestions WHERE id = %s",
+                    (suggestion_id,)
+                )
+                sugg = cur.fetchone()
+                if not sugg:
+                    return {"status": "error", "message": "Suggestion not found"}
+                
+                photo_id, person_id, avatar_data, emb_raw, sim = sugg
+                emb = emb_raw
+                if isinstance(emb, str):
+                    try:
+                        emb = json.loads(emb)
+                    except:
+                        emb = []
+
+                if action == "accept":
+                    # 1. Link person_id into abragallery
+                    cur.execute("SELECT person_ids FROM abragallery WHERE id = %s", (photo_id,))
+                    p_row = cur.fetchone()
+                    existing_pids = []
+                    if p_row and p_row[0]:
+                        existing_pids = p_row[0] if isinstance(p_row[0], list) else json.loads(p_row[0])
+                    
+                    person_id_str = str(person_id)
+                    if person_id_str not in existing_pids:
+                        existing_pids.append(person_id_str)
+                        cur.execute(
+                            "UPDATE abragallery SET person_ids = %s WHERE id = %s",
+                            (json.dumps(existing_pids), photo_id)
+                        )
+
+                    # 2. Optionally store embedding in abra_people if < 3 embeddings
+                    if emb:
+                        cur.execute("SELECT embeddings FROM abra_people WHERE id = %s", (person_id,))
+                        person_embs_row = cur.fetchone()
+                        if person_embs_row:
+                            p_embs = person_embs_row[0] or []
+                            if isinstance(p_embs, str):
+                                try:
+                                    p_embs = json.loads(p_embs)
+                                except:
+                                    p_embs = []
+                            if len(p_embs) < 3:
+                                p_embs.append(emb)
+                                cur.execute(
+                                    "UPDATE abra_people SET embeddings = %s, updated_at = NOW() WHERE id = %s",
+                                    (json.dumps(p_embs), person_id)
+                                )
+
+                    # 3. Mark or delete suggestion
+                    cur.execute("DELETE FROM abra_face_suggestions WHERE id = %s", (suggestion_id,))
+                    conn.commit()
+                    return {"status": "success", "action": "accepted", "message": "Linked person to photo"}
+
+                elif action == "reject":
+                    cur.execute("DELETE FROM abra_face_suggestions WHERE id = %s", (suggestion_id,))
+                    conn.commit()
+                    return {"status": "success", "action": "rejected", "message": "Rejected match suggestion"}
+
+                elif action == "create_new":
+                    new_person_id = str(uuid.uuid4())
+                    new_embs = [emb] if emb else []
+                    new_name = body.name or None
+                    cur.execute(
+                        """
+                        INSERT INTO abra_people (id, name, avatar_data, embeddings, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, NOW(), NOW())
+                        """,
+                        (new_person_id, new_name, avatar_data, json.dumps(new_embs))
+                    )
+                    # Link to photo
+                    cur.execute("SELECT person_ids FROM abragallery WHERE id = %s", (photo_id,))
+                    p_row = cur.fetchone()
+                    existing_pids = []
+                    if p_row and p_row[0]:
+                        existing_pids = p_row[0] if isinstance(p_row[0], list) else json.loads(p_row[0])
+                    if new_person_id not in existing_pids:
+                        existing_pids.append(new_person_id)
+                        cur.execute(
+                            "UPDATE abragallery SET person_ids = %s WHERE id = %s",
+                            (json.dumps(existing_pids), photo_id)
+                        )
+                    cur.execute("DELETE FROM abra_face_suggestions WHERE id = %s", (suggestion_id,))
+                    conn.commit()
+                    return {"status": "success", "action": "created_new", "person_id": new_person_id}
+
+                else:
+                    return {"status": "error", "message": "Invalid action. Use 'accept', 'reject', or 'create_new'."}
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/people/scan_stream")
+async def scan_gallery_faces_stream(
+    token: str = Query(...),
+    similarity_threshold: float = Query(0.50),
+    review_threshold: float = Query(0.38),
+    reindex_all: bool = Query(False)
+):
+    """Server-Sent Events (SSE) stream providing real-time photo-by-photo scanning progress."""
+    try:
+        verify_access_token(token)
+    except Exception as e:
+        async def err_gen():
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        return StreamingResponse(err_gen(), media_type="text/event-stream")
+
+    def event_stream():
+        try:
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    if reindex_all:
+                        cur.execute("DELETE FROM abra_people")
+                        cur.execute("DELETE FROM abra_face_suggestions")
+                        cur.execute("UPDATE abragallery SET person_ids = '[]'::jsonb")
+                        conn.commit()
+                        yield f"data: {json.dumps({'type': 'status', 'message': 'Reset previous face indexes...'})}\n\n"
+
+                    cur.execute("SELECT id, name, avatar_data, embeddings FROM abra_people")
+                    people_rows = cur.fetchall()
+                    people_list = []
+                    for r in people_rows:
+                        emb = r[3]
+                        if isinstance(emb, str):
+                            try:
+                                emb = json.loads(emb)
+                            except:
+                                emb = []
+                        people_list.append({
+                            "id": str(r[0]),
+                            "name": r[1],
+                            "avatar_data": r[2],
+                            "embeddings": emb or []
+                        })
+
+                    if reindex_all:
+                        cur.execute("SELECT id, object_key, url, timestamp FROM abragallery ORDER BY timestamp DESC")
+                    else:
+                        cur.execute("SELECT id, object_key, url, timestamp FROM abragallery WHERE person_ids IS NULL OR person_ids = '[]'::jsonb ORDER BY timestamp DESC")
+                    
+                    photos_to_process = cur.fetchall()
+                    total_photos = len(photos_to_process)
+                    
+                    yield f"data: {json.dumps({'type': 'start', 'total_photos': total_photos, 'people_count': len(people_list), 'message': f'Found {total_photos} photos to scan'})}\n\n"
+
+                    processed_count = 0
+                    total_faces_found = 0
+                    total_suggestions = 0
+
+                    for idx, photo in enumerate(photos_to_process):
+                        photo_id, obj_key, raw_url, photo_ts = photo[0], photo[1], photo[2], photo[3]
+                        
+                        yield f"data: {json.dumps({'type': 'progress', 'index': idx + 1, 'total': total_photos, 'photo_id': photo_id, 'message': f'Scanning photo {idx + 1} of {total_photos}...'})}\n\n"
+
+                        image_bytes = None
+                        if obj_key:
+                            try:
+                                s3_obj = s3.get_object(Bucket=B2_BUCKET_NAME, Key=obj_key)
+                                image_bytes = s3_obj['Body'].read()
+                            except Exception as s3_err:
+                                print(f"[FaceProcess] S3 get error for {obj_key}: {s3_err}")
+
+                        if not image_bytes and raw_url and str(raw_url).startswith("http"):
+                            try:
+                                req = urllib.request.Request(raw_url, headers={'User-Agent': 'ABRA/1.0'})
+                                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                                    image_bytes = resp.read()
+                            except Exception as url_err:
+                                print(f"[FaceProcess] URL get error for {raw_url}: {url_err}")
+
+                        if not image_bytes:
+                            continue
+
+                        faces = extract_faces_from_image(image_bytes)
+                        total_faces_found += len(faces)
+                        photo_person_ids = []
+                        photo_auto_matches = 0
+                        photo_reviews = 0
+
+                        for face_data in faces:
+                            emb = face_data["embedding"]
+                            avatar_data = face_data["avatar_data"]
+                            
+                            status, candidate_id, sim = classify_face_match(
+                                emb, people_list, auto_threshold=similarity_threshold, review_threshold=review_threshold
+                            )
+                            
+                            if status == "auto_match" and candidate_id:
+                                photo_auto_matches += 1
+                                if candidate_id not in photo_person_ids:
+                                    photo_person_ids.append(candidate_id)
+                                person_obj = next((p for p in people_list if p["id"] == candidate_id), None)
+                                if person_obj and len(person_obj["embeddings"]) < 3 and sim < 0.88:
+                                    person_obj["embeddings"].append(emb)
+                                    cur.execute(
+                                        "UPDATE abra_people SET embeddings = %s, updated_at = NOW() WHERE id = %s",
+                                        (json.dumps(person_obj["embeddings"]), candidate_id)
+                                    )
+                            elif status == "needs_review" and candidate_id:
+                                photo_reviews += 1
+                                total_suggestions += 1
+                                # Save pending suggestion for user review (~40% match)
+                                cur.execute(
+                                    """
+                                    INSERT INTO abra_face_suggestions (photo_id, person_id, similarity, avatar_data, embedding, status, created_at)
+                                    VALUES (%s, %s, %s, %s, %s, 'pending', NOW())
+                                    """,
+                                    (photo_id, candidate_id, sim, avatar_data, json.dumps(emb))
+                                )
+                            else:
+                                # New distinct person (< review_threshold)
+                                new_id = str(uuid.uuid4())
+                                new_embeddings = [emb]
+                                cur.execute(
+                                    """
+                                    INSERT INTO abra_people (id, name, avatar_data, embeddings, created_at, updated_at)
+                                    VALUES (%s, %s, %s, %s, NOW(), NOW())
+                                    """,
+                                    (new_id, None, avatar_data, json.dumps(new_embeddings))
+                                )
+                                new_person = {
+                                    "id": new_id,
+                                    "name": None,
+                                    "avatar_data": avatar_data,
+                                    "embeddings": new_embeddings
+                                }
+                                people_list.append(new_person)
+                                if new_id not in photo_person_ids:
+                                    photo_person_ids.append(new_id)
+
+                        cur.execute(
+                            "UPDATE abragallery SET person_ids = %s WHERE id = %s",
+                            (json.dumps(photo_person_ids), photo_id)
+                        )
+                        processed_count += 1
+                        conn.commit()
+
+                        yield f"data: {json.dumps({'type': 'photo_done', 'index': idx + 1, 'total': total_photos, 'photo_id': photo_id, 'faces_found': len(faces), 'auto_matches': photo_auto_matches, 'needs_review': photo_reviews, 'message': f'Photo {idx + 1}/{total_photos}: {len(faces)} faces ({photo_auto_matches} matched, {photo_reviews} for review)'})}\n\n"
+
+                    yield f"data: {json.dumps({'type': 'complete', 'processed_photos': processed_count, 'total_faces_found': total_faces_found, 'total_people': len(people_list), 'total_suggestions': total_suggestions, 'message': f'Scan complete! Analyzed {processed_count} photos, identified {len(people_list)} people.'})}\n\n"
+
+        except Exception as e:
+            print(f"[FaceStream Error]: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+@app.post("/people/process_gallery")
+async def process_gallery_faces(
+    body: ProcessGalleryModel = ProcessGalleryModel(),
+    token: HTTPAuthorizationCredentials = Depends(HTTPBearer())
+):
+    try:
+        verify_access_token(token.credentials)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    try:
+        threshold = float(body.similarity_threshold if body.similarity_threshold is not None else 0.50)
+        review_threshold = float(body.review_threshold if body.review_threshold is not None else 0.38)
+        reindex_all = bool(body.reindex_all)
+
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                if reindex_all:
+                    cur.execute("DELETE FROM abra_people")
+                    cur.execute("DELETE FROM abra_face_suggestions")
+                    cur.execute("UPDATE abragallery SET person_ids = '[]'::jsonb")
+                    conn.commit()
+
+                cur.execute("SELECT id, name, avatar_data, embeddings FROM abra_people")
+                people_rows = cur.fetchall()
+                people_list = []
+                for r in people_rows:
+                    emb = r[3]
+                    if isinstance(emb, str):
+                        try:
+                            emb = json.loads(emb)
+                        except:
+                            emb = []
+                    people_list.append({
+                        "id": str(r[0]),
+                        "name": r[1],
+                        "avatar_data": r[2],
+                        "embeddings": emb or []
+                    })
+
+                if reindex_all:
+                    cur.execute("SELECT id, object_key, url FROM abragallery ORDER BY timestamp DESC")
+                else:
+                    cur.execute("SELECT id, object_key, url FROM abragallery WHERE person_ids IS NULL OR person_ids = '[]'::jsonb ORDER BY timestamp DESC")
+                
+                photos_to_process = cur.fetchall()
+                processed_count = 0
+                total_faces_found = 0
+                total_suggestions = 0
+
+                for photo in photos_to_process:
+                    photo_id, obj_key, raw_url = photo[0], photo[1], photo[2]
+                    image_bytes = None
+
+                    if obj_key:
+                        try:
+                            s3_obj = s3.get_object(Bucket=B2_BUCKET_NAME, Key=obj_key)
+                            image_bytes = s3_obj['Body'].read()
+                        except Exception as s3_err:
+                            print(f"[FaceProcess] S3 get error for {obj_key}: {s3_err}")
+
+                    if not image_bytes and raw_url and str(raw_url).startswith("http"):
+                        try:
+                            req = urllib.request.Request(raw_url, headers={'User-Agent': 'ABRA/1.0'})
+                            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                                image_bytes = resp.read()
+                        except Exception as url_err:
+                            print(f"[FaceProcess] URL get error for {raw_url}: {url_err}")
+
+                    if not image_bytes:
+                        continue
+
+                    faces = extract_faces_from_image(image_bytes)
+                    total_faces_found += len(faces)
+                    photo_person_ids = []
+
+                    for face_data in faces:
+                        emb = face_data["embedding"]
+                        avatar_data = face_data["avatar_data"]
+                        
+                        status, candidate_id, sim = classify_face_match(
+                            emb, people_list, auto_threshold=threshold, review_threshold=review_threshold
+                        )
+                        
+                        if status == "auto_match" and candidate_id:
+                            if candidate_id not in photo_person_ids:
+                                photo_person_ids.append(candidate_id)
+                            person_obj = next((p for p in people_list if p["id"] == candidate_id), None)
+                            if person_obj and len(person_obj["embeddings"]) < 3 and sim < 0.88:
+                                person_obj["embeddings"].append(emb)
+                                cur.execute(
+                                    "UPDATE abra_people SET embeddings = %s, updated_at = NOW() WHERE id = %s",
+                                    (json.dumps(person_obj["embeddings"]), candidate_id)
+                                )
+                        elif status == "needs_review" and candidate_id:
+                            total_suggestions += 1
+                            cur.execute(
+                                """
+                                INSERT INTO abra_face_suggestions (photo_id, person_id, similarity, avatar_data, embedding, status, created_at)
+                                VALUES (%s, %s, %s, %s, %s, 'pending', NOW())
+                                """,
+                                (photo_id, candidate_id, sim, avatar_data, json.dumps(emb))
+                            )
+                        else:
+                            new_id = str(uuid.uuid4())
+                            new_embeddings = [emb]
+                            cur.execute(
+                                """
+                                INSERT INTO abra_people (id, name, avatar_data, embeddings, created_at, updated_at)
+                                VALUES (%s, %s, %s, %s, NOW(), NOW())
+                                """,
+                                (new_id, None, avatar_data, json.dumps(new_embeddings))
+                            )
+                            new_person = {
+                                "id": new_id,
+                                "name": None,
+                                "avatar_data": avatar_data,
+                                "embeddings": new_embeddings
+                            }
+                            people_list.append(new_person)
+                            if new_id not in photo_person_ids:
+                                photo_person_ids.append(new_id)
+
+                    cur.execute(
+                        "UPDATE abragallery SET person_ids = %s WHERE id = %s",
+                        (json.dumps(photo_person_ids), photo_id)
+                    )
+                    processed_count += 1
+
+                conn.commit()
+
+        return {
+            "status": "success",
+            "processed_photos": processed_count,
+            "total_faces_found": total_faces_found,
+            "total_people": len(people_list),
+            "pending_suggestions": total_suggestions
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}

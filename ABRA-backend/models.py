@@ -45,6 +45,7 @@ class GalleryModel(BaseModel):
     battery_level: Optional[float] = None
     is_charging: Optional[bool] = None
     network_type: Optional[str] = None
+    person_ids: Optional[Any] = None
 
 class PaymentModel(BaseModel):
     vendor: Optional[str] = "Payment"
@@ -52,3 +53,15 @@ class PaymentModel(BaseModel):
     timestamp: Optional[Union[datetime, str]] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+
+class PersonUpdateModel(BaseModel):
+    name: Optional[str] = None
+
+class ProcessGalleryModel(BaseModel):
+    similarity_threshold: Optional[float] = 0.50
+    review_threshold: Optional[float] = 0.38
+    reindex_all: Optional[bool] = False
+
+class ResolveSuggestionModel(BaseModel):
+    action: str  # 'accept', 'reject', 'create_new'
+    name: Optional[str] = None
