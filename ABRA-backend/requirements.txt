@@ -7,6 +7,8 @@ psycopg-binary
 python-dotenv
 python-multipart
 boto3
-opencv-python
+opencv-python-headless
 pandas
 scikit-learn
+onnxruntime
+insightface
