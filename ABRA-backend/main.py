@@ -9,6 +9,7 @@ from facial import extract_faces_from_image, find_matching_person, cosine_simila
 import csv
 import io
 import json
+import gc
 import urllib.request
 import urllib.parse
 from datetime import datetime, date, timezone
@@ -1475,7 +1476,12 @@ async def scan_gallery_faces_stream(
                         processed_count += 1
                         conn.commit()
 
-                        yield f"data: {json.dumps({'type': 'photo_done', 'index': idx + 1, 'total': total_photos, 'photo_id': photo_id, 'faces_found': len(faces), 'auto_matches': photo_auto_matches, 'needs_review': photo_reviews, 'message': f'Photo {idx + 1}/{total_photos}: {len(faces)} faces ({photo_auto_matches} matched, {photo_reviews} for review)'})}\n\n"
+                        del image_bytes
+                        del faces
+                        if (idx + 1) % 5 == 0:
+                            gc.collect()
+
+                        yield f"data: {json.dumps({'type': 'photo_done', 'index': idx + 1, 'total': total_photos, 'photo_id': photo_id, 'faces_found': len(photo_person_ids), 'auto_matches': photo_auto_matches, 'needs_review': photo_reviews, 'message': f'Photo {idx + 1}/{total_photos}: {len(photo_person_ids)} faces ({photo_auto_matches} matched, {photo_reviews} for review)'})}\n\n"
 
                     yield f"data: {json.dumps({'type': 'complete', 'processed_photos': processed_count, 'total_faces_found': total_faces_found, 'total_people': len(people_list), 'total_suggestions': total_suggestions, 'message': f'Scan complete! Analyzed {processed_count} photos, identified {len(people_list)} people.'})}\n\n"
 
@@ -1612,6 +1618,10 @@ async def process_gallery_faces(
                         (json.dumps(photo_person_ids), photo_id)
                     )
                     processed_count += 1
+                    del image_bytes
+                    del faces
+                    if processed_count % 5 == 0:
+                        gc.collect()
 
                 conn.commit()
 

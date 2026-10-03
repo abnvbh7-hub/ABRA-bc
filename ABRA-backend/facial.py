@@ -4,14 +4,15 @@ import base64
 from typing import List, Dict, Any, Optional, Tuple
 from insightface.app import FaceAnalysis
 
-# Initialize FaceAnalysis singleton with buffalo_l model
+# Initialize FaceAnalysis singleton with buffalo_s (lightweight MobileNet/MobileFaceNet model ~15MB instead of buffalo_l ~300MB)
 _app = None
 
 def get_face_app():
     global _app
     if _app is None:
         _app = FaceAnalysis(
-            name="buffalo_l",
+            name="buffalo_s",
+            allowed_modules=["detection", "recognition"],
             providers=["CPUExecutionProvider"]
         )
         _app.prepare(ctx_id=-1, det_size=(640, 640))
@@ -79,8 +80,17 @@ def extract_faces_from_image(image_input: Any) -> List[Dict[str, Any]]:
     else:
         raise ValueError("Invalid image input type")
         
-    if image is None:
+    if image is None or image.size == 0:
         return []
+
+    # Downscale very large images (e.g. 4000x3000) to max 1280px to save RAM on Render 512MB tier
+    h, w = image.shape[:2]
+    max_dim = 1280
+    scale = 1.0
+    if max(h, w) > max_dim:
+        scale = max_dim / float(max(h, w))
+        new_w, new_h = int(w * scale), int(h * scale)
+        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
         
     detected_faces = app.get(image)
     results = []
