@@ -1,0 +1,67 @@
+from datetime import datetime, date
+from typing import Optional, Union, Any
+
+from pydantic import BaseModel
+
+class LoginModel(BaseModel):
+    username: str
+    password:str
+
+
+class AbraModel(BaseModel):
+    timestamp: Optional[datetime] = None
+    day: Optional[date] = None
+
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+    speed: Optional[float] = None
+    direction: Optional[float] = None
+
+    accel_x: Optional[float] = None
+    accel_y: Optional[float] = None
+    accel_z: Optional[float] = None
+
+    gyro_x: Optional[float] = None
+    gyro_y: Optional[float] = None
+    gyro_z: Optional[float] = None
+
+    wifi_count: Optional[int] = None
+
+    vendor: Optional[str] = None
+    amount: Optional[float] = None
+
+    battery_level: Optional[float] = None
+    is_charging: Optional[bool] = None
+    network_type: Optional[str] = None
+
+class GalleryModel(BaseModel):
+    url: Optional[str] = None
+    object_key: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    timestamp: Optional[datetime] = None
+    speed: Optional[float] = None
+    battery_level: Optional[float] = None
+    is_charging: Optional[bool] = None
+    network_type: Optional[str] = None
+    person_ids: Optional[Any] = None
+
+class PaymentModel(BaseModel):
+    vendor: Optional[str] = "Payment"
+    amount: float
+    timestamp: Optional[Union[datetime, str]] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+class PersonUpdateModel(BaseModel):
+    name: Optional[str] = None
+
+class ProcessGalleryModel(BaseModel):
+    similarity_threshold: Optional[float] = 0.44
+    review_threshold: Optional[float] = 0.32
+    reindex_all: Optional[bool] = False
+
+class ResolveSuggestionModel(BaseModel):
+    action: str  # 'accept', 'reject', 'create_new'
+    name: Optional[str] = None
