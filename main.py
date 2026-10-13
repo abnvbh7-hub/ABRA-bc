@@ -2045,3 +2045,816 @@ async def process_gallery_faces(
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+# ====================================================
+# Real-Time TomTom Traffic API Endpoints & Stats
+# ====================================================
+_traffic_cache = {
+    "flow": {},
+    "incidents": {}
+}
+
+@app.get("/api/traffic/config")
+async def get_traffic_config():
+    api_key = os.getenv("TOMTOM_API_KEY", "")
+    return {
+        "status": "success",
+        "configured": bool(api_key),
+        "api_key": api_key,
+        "provider": "TomTom Traffic API",
+        "default_flow_style": "relative",
+        "default_incident_style": "s0"
+    }
+
+@app.get("/api/traffic/flow-segment")
+async def get_traffic_flow_segment(
+    lat: float = Query(..., description="Latitude"),
+    lon: float = Query(..., description="Longitude"),
+    zoom: int = Query(10, ge=0, le=22),
+    style: str = Query("relative-delay"),
+    unit: str = Query("KMPH")
+):
+    api_key = os.getenv("TOMTOM_API_KEY", "")
+    if not api_key:
+        return {"status": "error", "message": "TOMTOM_API_KEY not configured"}
+
+    cache_key = f"{round(lat, 4)}_{round(lon, 4)}_{style}_{zoom}_{unit}"
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cached = _traffic_cache["flow"].get(cache_key)
+    if cached and (now_ts - cached["timestamp"] < 30):
+        return cached["data"]
+
+    try:
+        url = f"https://api.tomtom.com/traffic/services/4/flowSegmentData/{style}/{zoom}/json?key={api_key}&point={lat},{lon}&unit={unit}"
+        req = urllib.request.Request(url, headers={"User-Agent": "ABRA-Traffic-Service/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        raw = data.get("flowSegmentData", {})
+        current_speed = float(raw.get("currentSpeed", 0))
+        free_flow_speed = float(raw.get("freeFlowSpeed", 0))
+        current_travel_time = float(raw.get("currentTravelTime", 0))
+        free_flow_travel_time = float(raw.get("freeFlowTravelTime", 0))
+        delay_seconds = max(0.0, current_travel_time - free_flow_travel_time)
+
+        ratio = (current_speed / free_flow_speed) if free_flow_speed > 0 else 1.0
+        congestion_level = "fluid"
+        if raw.get("roadClosure"):
+            congestion_level = "closed"
+        elif ratio < 0.35:
+            congestion_level = "jam"
+        elif ratio < 0.65:
+            congestion_level = "heavy"
+        elif ratio < 0.85:
+            congestion_level = "moderate"
+
+        coords = []
+        raw_coords = raw.get("coordinates", {}).get("coordinate", [])
+        if isinstance(raw_coords, list):
+            coords = [[c.get("longitude"), c.get("latitude")] for c in raw_coords if "longitude" in c and "latitude" in c]
+
+        result = {
+            "status": "success",
+            "current_speed": current_speed,
+            "free_flow_speed": free_flow_speed,
+            "unit": unit,
+            "current_travel_time": current_travel_time,
+            "free_flow_travel_time": free_flow_travel_time,
+            "delay_seconds": delay_seconds,
+            "confidence": round(float(raw.get("confidence", 0)) * 100, 1),
+            "road_closure": bool(raw.get("roadClosure", False)),
+            "congestion_level": congestion_level,
+            "coordinates": coords,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+        _traffic_cache["flow"][cache_key] = {"timestamp": now_ts, "data": result}
+        return result
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/traffic/incidents")
+async def get_traffic_incidents(
+    min_lon: float = Query(...),
+    min_lat: float = Query(...),
+    max_lon: float = Query(...),
+    max_lat: float = Query(...),
+    language: str = Query("en-GB")
+):
+    api_key = os.getenv("TOMTOM_API_KEY", "")
+    if not api_key:
+        return {"status": "error", "message": "TOMTOM_API_KEY not configured"}
+
+    cache_key = f"{round(min_lon, 3)}_{round(min_lat, 3)}_{round(max_lon, 3)}_{round(max_lat, 3)}"
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cached = _traffic_cache["incidents"].get(cache_key)
+    if cached and (now_ts - cached["timestamp"] < 30):
+        return cached["data"]
+
+    try:
+        fields = "{incidents{type,geometry{type,coordinates},properties{id,iconCategory,magnitudeOfDelay,events{description,code},startTime,endTime,from,to,length,delay,roadNumbers,probabilityOfOccurrence,timeValidity}}}"
+        encoded_fields = urllib.parse.quote(fields)
+        url = f"https://api.tomtom.com/traffic/services/5/incidentDetails?key={api_key}&bbox={min_lon},{min_lat},{max_lon},{max_lat}&language={language}&fields={encoded_fields}"
+
+        req = urllib.request.Request(url, headers={"User-Agent": "ABRA-Traffic-Service/1.0"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        incidents = data.get("incidents", [])
+        result = {
+            "status": "success",
+            "count": len(incidents),
+            "incidents": incidents,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        _traffic_cache["incidents"][cache_key] = {"timestamp": now_ts, "data": result}
+        return result
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/traffic/stats")
+async def get_traffic_stats(
+    lat: float = Query(..., description="Center latitude"),
+    lon: float = Query(..., description="Center longitude"),
+    radius_km: float = Query(8.0, ge=0.5, le=50.0)
+):
+    api_key = os.getenv("TOMTOM_API_KEY", "")
+    if not api_key:
+        return {"status": "error", "message": "TOMTOM_API_KEY not configured"}
+
+    delta_deg = radius_km / 111.0
+    min_lon = lon - delta_deg
+    max_lon = lon + delta_deg
+    min_lat = lat - (delta_deg / 1.1)
+    max_lat = lat + (delta_deg / 1.1)
+
+    try:
+        fields = "{incidents{type,geometry{type,coordinates},properties{id,iconCategory,magnitudeOfDelay,events{description,code},startTime,endTime,from,to,length,delay,roadNumbers}}}"
+        encoded_fields = urllib.parse.quote(fields)
+        url = f"https://api.tomtom.com/traffic/services/5/incidentDetails?key={api_key}&bbox={min_lon},{min_lat},{max_lon},{max_lat}&language=en-GB&fields={encoded_fields}"
+        req = urllib.request.Request(url, headers={"User-Agent": "ABRA-Traffic-Service/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            incidents_data = json.loads(resp.read().decode("utf-8"))
+
+        incidents = incidents_data.get("incidents", [])
+        total_delay_secs = sum(float(inc.get("properties", {}).get("delay", 0) or 0) for inc in incidents)
+        jams = sum(1 for inc in incidents if inc.get("properties", {}).get("iconCategory") == 6)
+        accidents = sum(1 for inc in incidents if inc.get("properties", {}).get("iconCategory") == 1)
+        roadworks = sum(1 for inc in incidents if inc.get("properties", {}).get("iconCategory") == 9)
+        closures = sum(1 for inc in incidents if inc.get("properties", {}).get("iconCategory") in (7, 8))
+        major_delays = sum(1 for inc in incidents if (inc.get("properties", {}).get("magnitudeOfDelay") or 0) >= 3)
+
+        return {
+            "status": "success",
+            "center": {"lat": lat, "lon": lon},
+            "radius_km": radius_km,
+            "total_incidents": len(incidents),
+            "jams": jams,
+            "accidents": accidents,
+            "roadworks": roadworks,
+            "closures": closures,
+            "major_delays": major_delays,
+            "total_delay_seconds": total_delay_secs,
+            "total_delay_minutes": round(total_delay_secs / 60.0, 1),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# ====================================================
+# TomTom Places Search API (Next-Gen Orbis Places API)
+# ====================================================
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+import math
+
+class PlacesSuggestRequest(BaseModel):
+    query: str
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    origin: Optional[Dict[str, Any]] = None
+    maxResults: Optional[int] = 10
+    filters: Optional[Dict[str, Any]] = None
+    preferences: Optional[Dict[str, Any]] = None
+
+class PlacesDiscoverRequest(BaseModel):
+    query: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    origin: Optional[Dict[str, Any]] = None
+    radius: Optional[int] = None
+    maxResults: Optional[int] = 30
+    filters: Optional[Dict[str, Any]] = None
+    preferences: Optional[Dict[str, Any]] = None
+    category: Optional[str] = None
+    category_set: Optional[str] = None
+
+_places_cache = {
+    "suggest": {},
+    "discover": {},
+    "details": {},
+    "nearby": {},
+    "search": {},
+    "category": {},
+    "geocode": {}
+}
+
+def normalize_orbis_place(item: dict, center_lat: Optional[float] = None, center_lon: Optional[float] = None) -> dict:
+    item_id = item.get("id") or item.get("entityId") or ""
+    title = item.get("title") or item.get("poi", {}).get("name") or "Place"
+    
+    # Coordinates: Orbis returns [lon, lat] in GeoJSON format
+    coords = item.get("position", {}).get("coordinates")
+    if coords and isinstance(coords, list) and len(coords) >= 2:
+        lon, lat = float(coords[0]), float(coords[1])
+    else:
+        lat = item.get("position", {}).get("lat")
+        lon = item.get("position", {}).get("lon")
+    
+    # Distance in meters
+    dist = item.get("distanceInMeters") or item.get("dist")
+    if dist is None and center_lat is not None and center_lon is not None and lat is not None and lon is not None:
+        dlat = math.radians(lat - center_lat)
+        dlon = math.radians(lon - center_lon)
+        a = math.sin(dlat / 2)**2 + math.cos(math.radians(center_lat)) * math.cos(math.radians(lat)) * math.sin(dlon / 2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        dist = round(6371000 * c, 1)
+
+    # Categories
+    categories = []
+    poi_types = item.get("poiTypes", [])
+    if isinstance(poi_types, list):
+        for pt in poi_types:
+            name = pt.get("name") or pt.get("id")
+            if name:
+                categories.append(name)
+    if not categories and "poi" in item and "categories" in item["poi"]:
+        categories = item["poi"]["categories"]
+    if not categories:
+        categories = ["POI"]
+
+    # Address
+    raw_addr = item.get("address", {})
+    parts = [
+        raw_addr.get("houseNumber"),
+        raw_addr.get("street"),
+        raw_addr.get("neighborhood"),
+        raw_addr.get("municipality"),
+        raw_addr.get("countrySubdivision"),
+        raw_addr.get("country")
+    ]
+    addr_str = ", ".join([p for p in parts if p]) or raw_addr.get("freeformAddress") or ", ".join(item.get("subtitles", [])) or "Address unavailable"
+
+    # Contacts
+    phone = None
+    url = None
+    contacts = item.get("contacts", [])
+    if isinstance(contacts, list):
+        for c in contacts:
+            if not phone and c.get("phones"):
+                phone = c["phones"][0] if isinstance(c["phones"], list) else str(c["phones"])
+            if not url and c.get("websites"):
+                url = c["websites"][0] if isinstance(c["websites"], list) else str(c["websites"])
+    if not phone and "poi" in item:
+        phone = item["poi"].get("phone")
+    if not url and "poi" in item:
+        url = item["poi"].get("url")
+
+    # Path parameters for details
+    more = item.get("more", {})
+    path_params = {}
+    if "pathParameters" in more:
+        for p in more["pathParameters"]:
+            path_params[p.get("parameter")] = p.get("argument")
+
+    detail_type = path_params.get("type") or ("pois" if item.get("type") == "poi" else "areas")
+    detail_id = path_params.get("id") or item_id
+
+    return {
+        "id": item_id,
+        "title": title,
+        "type": item.get("type", "poi"),
+        "dist": dist,
+        "distanceInMeters": dist,
+        "position": {
+            "lat": lat,
+            "lon": lon
+        },
+        "address": {
+            "freeformAddress": addr_str,
+            "municipality": raw_addr.get("municipality", ""),
+            "country": raw_addr.get("country", ""),
+            "raw": raw_addr
+        },
+        "poi": {
+            "name": title,
+            "categories": categories,
+            "phone": phone,
+            "url": url,
+            "brands": item.get("poiBrands") or (item.get("poi", {}).get("brands"))
+        },
+        "contacts": contacts,
+        "poiTypes": poi_types,
+        "more": more,
+        "detailType": detail_type,
+        "detailId": detail_id,
+        "raw": item
+    }
+
+# -----------------------------------------------------------------
+# 1. POST /places/suggest - Suggest a location (Autocomplete)
+# -----------------------------------------------------------------
+@app.post("/places/suggest")
+@app.post("/api/places/suggest")
+async def suggest_places(req: PlacesSuggestRequest):
+    api_key = os.getenv("TOMTOM_API_KEY", "") or "YCWqMdqB0kPi0mLxLNN7WXMabGcCnQSd"
+    if not api_key:
+        return {"status": "error", "message": "TOMTOM_API_KEY not configured"}
+
+    q = req.query.strip()
+    if not q:
+        return {"status": "success", "results": []}
+
+    cache_key = f"{q.lower()}_{round(req.lat or 0, 3)}_{round(req.lon or 0, 3)}_{req.maxResults}"
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cached = _places_cache["suggest"].get(cache_key)
+    if cached and (now_ts - cached["timestamp"] < 60):
+        return cached["data"]
+
+    # Build Orbis suggest body
+    body: Dict[str, Any] = {
+        "query": q,
+        "maxResults": min(max(req.maxResults or 10, 1), 20)
+    }
+
+    if req.origin:
+        body["origin"] = req.origin
+    elif req.lat is not None and req.lon is not None:
+        body["origin"] = {"type": "point", "coordinates": [req.lon, req.lat]}
+
+    if req.preferences:
+        body["preferences"] = req.preferences
+    elif req.lat is not None and req.lon is not None:
+        body["preferences"] = {"geometry": {"type": "point", "coordinates": [req.lon, req.lat]}}
+
+    if req.filters:
+        body["filters"] = req.filters
+
+    try:
+        url = "https://api.tomtom.com/maps/orbis/places/suggest"
+        post_data = json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=post_data,
+            headers={
+                "Content-Type": "application/json",
+                "TomTom-Api-Key": api_key,
+                "TomTom-Api-Version": "3",
+                "Attributes": "results",
+                "User-Agent": "ABRA-Places-Service/1.0"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(request, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        results = data.get("results", [])
+        payload = {
+            "status": "success",
+            "query": q,
+            "count": len(results),
+            "results": results,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        _places_cache["suggest"][cache_key] = {"timestamp": now_ts, "data": payload}
+        return payload
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# -----------------------------------------------------------------
+# 2. POST /places/discover - Discover locations
+# -----------------------------------------------------------------
+@app.post("/places/discover")
+@app.post("/api/places/discover")
+async def discover_places(req: PlacesDiscoverRequest):
+    api_key = os.getenv("TOMTOM_API_KEY", "") or "YCWqMdqB0kPi0mLxLNN7WXMabGcCnQSd"
+    if not api_key:
+        return {"status": "error", "message": "TOMTOM_API_KEY not configured"}
+
+    q = (req.query or "").strip()
+    cache_key = f"{q.lower()}_{round(req.lat or 0, 3)}_{round(req.lon or 0, 3)}_{req.radius}_{req.maxResults}_{req.category or ''}"
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cached = _places_cache["discover"].get(cache_key)
+    if cached and (now_ts - cached["timestamp"] < 90):
+        return cached["data"]
+
+    # Construct request payload
+    body: Dict[str, Any] = {
+        "maxResults": min(max(req.maxResults or 30, 1), 100)
+    }
+
+    if q:
+        body["query"] = q
+
+    if req.origin:
+        body["origin"] = req.origin
+    elif req.lat is not None and req.lon is not None:
+        body["origin"] = {"type": "point", "coordinates": [req.lon, req.lat]}
+
+    if req.preferences:
+        body["preferences"] = req.preferences
+    elif req.lat is not None and req.lon is not None:
+        body["preferences"] = {"geometry": {"type": "point", "coordinates": [req.lon, req.lat]}}
+
+    # Filters
+    filters = req.filters or {}
+    if not filters.get("types"):
+        filters["types"] = ["poi"]
+    body["filters"] = filters
+
+    # If query is empty and no poiTypes in filters, provide default category or query
+    if not body.get("query") and not filters.get("poiTypes"):
+        if req.category:
+            body["query"] = req.category
+        else:
+            body["query"] = "popular places"
+
+    try:
+        url = "https://api.tomtom.com/maps/orbis/places/discover"
+        post_data = json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=post_data,
+            headers={
+                "Content-Type": "application/json",
+                "TomTom-Api-Key": api_key,
+                "TomTom-Api-Version": "3",
+                "Attributes": "results",
+                "User-Agent": "ABRA-Places-Service/1.0"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(request, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        raw_results = data.get("results", [])
+        normalized = [normalize_orbis_place(r, req.lat, req.lon) for r in raw_results]
+
+        payload = {
+            "status": "success",
+            "query": q,
+            "count": len(normalized),
+            "results": normalized,
+            "center": {"lat": req.lat, "lon": req.lon} if req.lat and req.lon else None,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        _places_cache["discover"][cache_key] = {"timestamp": now_ts, "data": payload}
+        return payload
+    except Exception as e:
+        # Fallback to TomTom Search API v2 if Orbis discover faces an error
+        try:
+            fallback_q = q or req.category or "places"
+            encoded_query = urllib.parse.quote(fallback_q)
+            fallback_url = f"https://api.tomtom.com/search/2/search/{encoded_query}.json?key={api_key}&limit={req.maxResults or 30}"
+            if req.lat is not None and req.lon is not None:
+                fallback_url += f"&lat={req.lat}&lon={req.lon}&radius={req.radius or 5000}"
+            req_fb = urllib.request.Request(fallback_url, headers={"User-Agent": "ABRA-Places-Service/1.0"})
+            with urllib.request.urlopen(req_fb, timeout=10) as resp_fb:
+                fb_data = json.loads(resp_fb.read().decode("utf-8"))
+            results_fb = fb_data.get("results", [])
+            normalized_fb = [normalize_orbis_place(r, req.lat, req.lon) for r in results_fb]
+            return {
+                "status": "success",
+                "query": q,
+                "count": len(normalized_fb),
+                "results": normalized_fb,
+                "center": {"lat": req.lat, "lon": req.lon} if req.lat and req.lon else None,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        except Exception as e_fb:
+            return {"status": "error", "message": f"{str(e)} | Fallback: {str(e_fb)}"}
+
+# -----------------------------------------------------------------
+# 3. GET /places/details/{type}/{id} - Details for a location
+# -----------------------------------------------------------------
+@app.get("/places/details/{type}/{id}")
+@app.get("/api/places/details/{type}/{id}")
+async def get_place_details(
+    type: str,
+    id: str,
+    attributes: str = Query("contacts,address,poiTypes,title,position,openingHours,geometry")
+):
+    api_key = os.getenv("TOMTOM_API_KEY", "") or "YCWqMdqB0kPi0mLxLNN7WXMabGcCnQSd"
+    if not api_key:
+        return {"status": "error", "message": "TOMTOM_API_KEY not configured"}
+
+    cache_key = f"{type}_{id}_{attributes}"
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cached = _places_cache["details"].get(cache_key)
+    if cached and (now_ts - cached["timestamp"] < 300):
+        return cached["data"]
+
+    try:
+        url = f"https://api.tomtom.com/maps/orbis/places/details/{urllib.parse.quote(type)}/{urllib.parse.quote(id)}"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "TomTom-Api-Key": api_key,
+                "TomTom-Api-Version": "3",
+                "Attributes": attributes,
+                "User-Agent": "ABRA-Places-Service/1.0"
+            }
+        )
+        with urllib.request.urlopen(request, timeout=10) as resp:
+            details_data = json.loads(resp.read().decode("utf-8"))
+
+        payload = {
+            "status": "success",
+            "type": type,
+            "id": id,
+            "details": details_data,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        _places_cache["details"][cache_key] = {"timestamp": now_ts, "data": payload}
+        return payload
+    except urllib.error.HTTPError as e:
+        # If specific attributes are rejected, try minimal safe attributes
+        try:
+            req_min = urllib.request.Request(
+                f"https://api.tomtom.com/maps/orbis/places/details/{type}/{id}",
+                headers={
+                    "TomTom-Api-Key": api_key,
+                    "TomTom-Api-Version": "3",
+                    "Attributes": "title,position,address,contacts",
+                    "User-Agent": "ABRA-Places-Service/1.0"
+                }
+            )
+            with urllib.request.urlopen(req_min, timeout=8) as resp_min:
+                details_data = json.loads(resp_min.read().decode("utf-8"))
+            return {
+                "status": "success",
+                "type": type,
+                "id": id,
+                "details": details_data,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        except Exception as e_min:
+            return {"status": "error", "message": f"HTTP {e.code}: {str(e_min)}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# -----------------------------------------------------------------
+# Backwards-Compatible Search Endpoints
+# -----------------------------------------------------------------
+@app.get("/api/places/nearby")
+async def get_nearby_places(
+    lat: float = Query(...),
+    lon: float = Query(...),
+    radius: int = Query(5000, ge=100, le=50000),
+    limit: int = Query(30, ge=1, le=100),
+    category_set: str = Query(None, description="Comma-separated categorySet IDs, e.g. 7315,7311"),
+    country_set: str = Query(None)
+):
+    discover_req = PlacesDiscoverRequest(
+        lat=lat,
+        lon=lon,
+        radius=radius,
+        maxResults=limit,
+        category_set=category_set
+    )
+    return await discover_places(discover_req)
+
+@app.get("/api/places/search")
+async def search_places(
+    query: str = Query(..., min_length=1),
+    lat: float = Query(None),
+    lon: float = Query(None),
+    radius: int = Query(10000, ge=100, le=50000),
+    limit: int = Query(30, ge=1, le=100),
+    category_set: str = Query(None)
+):
+    discover_req = PlacesDiscoverRequest(
+        query=query,
+        lat=lat,
+        lon=lon,
+        radius=radius,
+        maxResults=limit,
+        category_set=category_set
+    )
+    return await discover_places(discover_req)
+
+@app.get("/api/places/category")
+async def search_places_by_category(
+    category: str = Query(...),
+    lat: float = Query(...),
+    lon: float = Query(...),
+    radius: int = Query(5000, ge=100, le=50000),
+    limit: int = Query(30, ge=1, le=100)
+):
+    discover_req = PlacesDiscoverRequest(
+        query=category,
+        lat=lat,
+        lon=lon,
+        radius=radius,
+        maxResults=limit,
+        category=category
+    )
+    return await discover_places(discover_req)
+
+@app.get("/api/places/reverse-geocode")
+async def reverse_geocode_place(
+    lat: float = Query(...),
+    lon: float = Query(...)
+):
+    api_key = os.getenv("TOMTOM_API_KEY", "") or "YCWqMdqB0kPi0mLxLNN7WXMabGcCnQSd"
+    if not api_key:
+        return {"status": "error", "message": "TOMTOM_API_KEY not configured"}
+
+    cache_key = f"{round(lat, 5)}_{round(lon, 5)}"
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cached = _places_cache["geocode"].get(cache_key)
+    if cached and (now_ts - cached["timestamp"] < 300):
+        return cached["data"]
+
+    try:
+        url = f"https://api.tomtom.com/search/2/reverseGeocode/{lat},{lon}.json?key={api_key}"
+        req = urllib.request.Request(url, headers={"User-Agent": "ABRA-Places-Service/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        addresses = data.get("addresses", [])
+        primary = addresses[0] if addresses else {}
+        addr_info = primary.get("address", {})
+
+        payload = {
+            "status": "success",
+            "lat": lat,
+            "lon": lon,
+            "freeform_address": addr_info.get("freeformAddress") or "Unknown location",
+            "municipality": addr_info.get("municipality") or addr_info.get("municipalitySubdivision") or "",
+            "country": addr_info.get("country") or "",
+            "postal_code": addr_info.get("postalCode") or "",
+            "raw": primary
+        }
+        _places_cache["geocode"][cache_key] = {"timestamp": now_ts, "data": payload}
+        return payload
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# ====================================================
+# TomTom Routing API (Calculate Route & Path Guidance)
+# ====================================================
+_routing_cache = {}
+
+class RouteCalculateRequest(BaseModel):
+    start_lat: float
+    start_lon: float
+    dest_lat: float
+    dest_lon: float
+    travel_mode: Optional[str] = "car"
+    route_type: Optional[str] = "fastest"
+    traffic: Optional[bool] = True
+    depart_at: Optional[str] = None
+    language: Optional[str] = "en-GB"
+
+def format_route_duration(seconds: float) -> str:
+    if not seconds or seconds <= 0:
+        return "0 min"
+    mins = round(seconds / 60)
+    if mins < 60:
+        return f"{mins} min"
+    hrs = mins // 60
+    rem_mins = mins % 60
+    return f"{hrs}h {rem_mins}m" if rem_mins > 0 else f"{hrs}h"
+
+def format_route_distance(meters: float) -> str:
+    if not meters or meters <= 0:
+        return "0 m"
+    if meters < 1000:
+        return f"{round(meters)} m"
+    return f"{round(meters / 1000, 1)} km"
+
+@app.get("/api/routing/calculate")
+@app.post("/api/routing/calculate")
+async def calculate_route(
+    start_lat: Optional[float] = Query(None),
+    start_lon: Optional[float] = Query(None),
+    dest_lat: Optional[float] = Query(None),
+    dest_lon: Optional[float] = Query(None),
+    travel_mode: Optional[str] = Query("car"),
+    route_type: Optional[str] = Query("fastest"),
+    traffic: Optional[bool] = Query(True),
+    language: Optional[str] = Query("en-GB"),
+    body: Optional[RouteCalculateRequest] = None
+):
+    api_key = os.getenv("TOMTOM_API_KEY", "") or "YCWqMdqB0kPi0mLxLNN7WXMabGcCnQSd"
+    if not api_key:
+        return {"status": "error", "message": "TOMTOM_API_KEY not configured"}
+
+    s_lat = body.start_lat if body else start_lat
+    s_lon = body.start_lon if body else start_lon
+    d_lat = body.dest_lat if body else dest_lat
+    d_lon = body.dest_lon if body else dest_lon
+    t_mode = (body.travel_mode if body else travel_mode) or "car"
+    r_type = (body.route_type if body else route_type) or "fastest"
+    use_traffic = (body.traffic if body else traffic)
+    lang = (body.language if body else language) or "en-GB"
+
+    if s_lat is None or s_lon is None or d_lat is None or d_lon is None:
+        return {"status": "error", "message": "start_lat, start_lon, dest_lat, and dest_lon are required"}
+
+    cache_key = f"{round(s_lat, 4)}_{round(s_lon, 4)}_{round(d_lat, 4)}_{round(d_lon, 4)}_{t_mode}_{r_type}_{use_traffic}"
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cached = _routing_cache.get(cache_key)
+    if cached and (now_ts - cached["timestamp"] < 45):
+        return cached["data"]
+
+    try:
+        traffic_param = "true" if use_traffic else "false"
+        url = (
+            f"https://api.tomtom.com/routing/1/calculateRoute/{s_lat},{s_lon}:{d_lat},{d_lon}/json"
+            f"?key={api_key}"
+            f"&traffic={traffic_param}"
+            f"&travelMode={urllib.parse.quote(t_mode)}"
+            f"&routeType={urllib.parse.quote(r_type)}"
+            f"&instructionsType=text"
+            f"&language={urllib.parse.quote(lang)}"
+            f"&computeTravelTimeFor=all"
+        )
+
+        req = urllib.request.Request(url, headers={"User-Agent": "ABRA-Routing-Service/1.0"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        routes = data.get("routes", [])
+        if not routes:
+            return {"status": "error", "message": "No routes found between these locations"}
+
+        primary_route = routes[0]
+        summary = primary_route.get("summary", {})
+        legs = primary_route.get("legs", [])
+        
+        coordinates = []
+        if legs and "points" in legs[0]:
+            coordinates = [[p.get("longitude"), p.get("latitude")] for p in legs[0]["points"] if "longitude" in p and "latitude" in p]
+
+        guidance = primary_route.get("guidance", {})
+        raw_instructions = guidance.get("instructions", [])
+        instructions = []
+        for ins in raw_instructions:
+            p = ins.get("point", {})
+            instructions.append({
+                "message": ins.get("message", ""),
+                "street": ins.get("street", ""),
+                "point": [p.get("longitude"), p.get("latitude")] if p else None,
+                "type": ins.get("instructionType", ""),
+                "length_meters": ins.get("routeOffsetInMeters", 0),
+                "travel_time_seconds": ins.get("travelTimeInSeconds", 0)
+            })
+
+        length_meters = summary.get("lengthInMeters", 0)
+        travel_time_secs = summary.get("travelTimeInSeconds", 0)
+        traffic_delay_secs = summary.get("trafficDelayInSeconds", 0)
+
+        payload = {
+            "status": "success",
+            "start": {"lat": s_lat, "lon": s_lon},
+            "destination": {"lat": d_lat, "lon": d_lon},
+            "travel_mode": t_mode,
+            "route_type": r_type,
+            "summary": {
+                "length_meters": length_meters,
+                "length_formatted": format_route_distance(length_meters),
+                "travel_time_seconds": travel_time_secs,
+                "travel_time_formatted": format_route_duration(travel_time_secs),
+                "traffic_delay_seconds": traffic_delay_secs,
+                "traffic_delay_formatted": f"+{format_route_duration(traffic_delay_secs)}" if traffic_delay_secs > 0 else "No delay",
+                "departure_time": summary.get("departureTime"),
+                "arrival_time": summary.get("arrivalTime")
+            },
+            "coordinates": coordinates,
+            "geojson": {
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": coordinates
+                },
+                "properties": {
+                    "length_meters": length_meters,
+                    "travel_time_seconds": travel_time_secs,
+                    "traffic_delay_seconds": traffic_delay_secs,
+                    "travel_mode": t_mode
+                }
+            },
+            "instructions": instructions,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+        _routing_cache[cache_key] = {"timestamp": now_ts, "data": payload}
+        return payload
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode("utf-8")
+        return {"status": "error", "message": f"HTTP {e.code}: {err_msg}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
